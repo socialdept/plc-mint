@@ -23,3 +23,7 @@ serde_ipld_dagcbor = "0.7.0"
 # Crypto in debug builds is unbearably slow; optimize dependencies even in tests.
 [profile.dev.package."*"]
 opt-level = 3
+
+# sha2 only uses the ARMv8 SHA-256 instructions (Apple Silicon, Graviton) with `asm`.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
