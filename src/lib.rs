@@ -1,6 +1,7 @@
 pub mod cbor;
 pub mod didkey;
 pub mod example;
+pub mod gpu;
 pub mod grind;
 pub mod op;
 pub mod signer;

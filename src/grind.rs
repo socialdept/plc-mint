@@ -100,14 +100,14 @@ pub struct Outcome {
 
 #[derive(Clone)]
 pub struct Grinder {
-    key: SigningKey,
+    pub(crate) key: SigningKey,
     op: Value,
-    rule: Rule,
+    pub(crate) rule: Rule,
     /// SHA-256 of the unsigned op: the prehash every attempt signs.
-    digest: [u8; 32],
+    pub(crate) digest: [u8; 32],
     /// The signed op's DAG-CBOR with a placeholder signature at `slot`.
-    template: Vec<u8>,
-    slot: usize,
+    pub(crate) template: Vec<u8>,
+    pub(crate) slot: usize,
     base32: Encoding,
 }
 
@@ -277,7 +277,7 @@ impl Grinder {
 
     /// Builds the signed op from scratch and re-verifies it independently of the
     /// template, so a template bug can never produce a wrong result.
-    fn finish(&self, sig: &[u8; 64]) -> Result<(String, Value)> {
+    pub(crate) fn finish(&self, sig: &[u8; 64]) -> Result<(String, Value)> {
         let mut signed = self.op.clone();
         signed["sig"] = Value::String(BASE64URL_NOPAD.encode(sig));
 

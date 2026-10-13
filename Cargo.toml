@@ -20,6 +20,18 @@ sha2 = "0.10"
 secp256k1 = { version = "0.29", features = ["global-context"] }
 serde_ipld_dagcbor = "0.7.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[features]
+# Metal GPU backend (macOS).
+gpu = ["dep:metal"]
+# Compiles the GPU kernel as C++ for the CPU so its math can be tested anywhere.
+gpu-ref = ["dep:cc"]
+
 # Crypto in debug builds is unbearably slow; optimize dependencies even in tests.
 [profile.dev.package."*"]
 opt-level = 3

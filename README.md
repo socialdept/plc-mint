@@ -64,6 +64,19 @@ Every mode signs the same digest with the same key and yields valid, low-S signa
 
 **`incremental` is only safe because exactly one signature per job is ever published.** Two published signatures with related nonces on the same message reveal the grind key. Losing signatures are never logged, stored or returned; a grind key must never be reused across jobs. It needs an ECDSA-literate review before production, which is why `grind` defaults to `rfc6979`.
 
+### GPU (spike, macOS / Metal)
+
+`gpu/kernel.metal` runs the `incremental` algorithm on the GPU: each GPU thread owns a nonce range (`k0 + t * 2^64`), walks `R_i = R_{i-1} + G`, batch-inverts point Z coordinates and nonces once per `--gpu-batch` attempts, then signs, hashes and matches on the GPU. Only the hit comes back, and it goes through the same CPU rebuild-and-verify as every other hit.
+
+```sh
+cargo build --release --features gpu        # macOS only
+$B gpu-selftest                             # debug dispatch: every GPU signature checked on the CPU
+$B bench --gpu --seconds 60 [--gpu-batch 32] [--gpu-threads 16384]
+$B grind --job job.json --gpu
+```
+
+The same kernel source compiles as C++ (`gpu/cpu_ref.cpp`), so its math is tested on any machine: `cargo test --features gpu-ref` checks that every signature verifies, uses exactly nonce `k_thread + i`, and gets the CPU's match verdict, across dispatches.
+
 ### Correctness
 
 Every hit is rebuilt from scratch (not from the hot-loop template), re-hashed and re-verified before it is printed. Tests (`cargo test`):

@@ -41,6 +41,8 @@ enum Command {
         /// Give up after this many attempts (exit code 2).
         #[arg(long)]
         max_attempts: Option<u64>,
+        #[command(flatten)]
+        gpu: GpuArgs,
     },
     /// Measure sustained attempts per second against a job that never matches.
     Bench {
@@ -56,6 +58,16 @@ enum Command {
         /// Seconds between progress lines on stderr.
         #[arg(long, default_value_t = 5)]
         report_every: u64,
+        #[command(flatten)]
+        gpu: GpuArgs,
+    },
+    /// Run the GPU kernel in debug mode and check every attempt on the CPU.
+    GpuSelftest {
+        #[command(flatten)]
+        gpu: GpuArgs,
+        /// Chunks per thread per dispatch.
+        #[arg(long, default_value_t = 2)]
+        chunks: u32,
     },
     /// Single-threaded cost per signature for each nonce mode, and per hash check.
     Profile {
@@ -79,6 +91,46 @@ enum Command {
     },
 }
 
+#[derive(clap::Args)]
+struct GpuArgs {
+    /// Grind on the GPU (Metal) instead of the CPU. Ignores --threads and --nonce.
+    #[arg(long)]
+    gpu: bool,
+    /// GPU: nonces per thread per batched inversion.
+    #[arg(long, default_value_t = 32)]
+    gpu_batch: usize,
+    /// GPU: threads per dispatch.
+    #[arg(long, default_value_t = 16384)]
+    gpu_threads: usize,
+}
+
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+fn gpu(args: &GpuArgs) -> Result<plc_mint::gpu::metal_backend::Gpu> {
+    let gpu = plc_mint::gpu::metal_backend::Gpu::new(args.gpu_batch, args.gpu_threads)?;
+    eprintln!("gpu: {} (batch {}, {} threads)", gpu.name(), gpu.batch, gpu.threads);
+    Ok(gpu)
+}
+
+/// Stands in for the Metal backend in builds without it; `gpu()` always errors.
+#[cfg(not(all(feature = "gpu", target_os = "macos")))]
+struct NoGpu;
+
+#[cfg(not(all(feature = "gpu", target_os = "macos")))]
+impl NoGpu {
+    fn run(&self, _: &Grinder, _: Limits, _: Duration, _: impl FnMut(u64, Duration)) -> Result<plc_mint::grind::Outcome> {
+        unreachable!()
+    }
+
+    fn selftest(&self, _: &Grinder, _: u32) -> Result<plc_mint::gpu::DebugReport> {
+        unreachable!()
+    }
+}
+
+#[cfg(not(all(feature = "gpu", target_os = "macos")))]
+fn gpu(_: &GpuArgs) -> Result<NoGpu> {
+    anyhow::bail!("built without GPU support: rebuild on macOS with `cargo build --release --features gpu`")
+}
+
 #[derive(Clone, clap::ValueEnum)]
 enum ModeArg {
     Prefix,
@@ -88,11 +140,17 @@ enum ModeArg {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Grind { job, threads, nonce, report_every, max_attempts } => {
+        Command::Grind { job, threads, nonce, report_every, max_attempts, gpu: gpu_args } => {
             let job: Job = serde_json::from_str(&read_input(&job)?).context("invalid job JSON")?;
             let threads = threads.unwrap_or_else(logical_cpus);
             let limits = Limits { max_attempts, ..Default::default() };
-            let outcome = Grinder::new(job)?.run(threads, nonce, limits, Duration::from_secs(report_every), progress)?;
+            let grinder = Grinder::new(job)?;
+            let every = Duration::from_secs(report_every);
+            let outcome = if gpu_args.gpu {
+                gpu(&gpu_args)?.run(&grinder, limits, every, progress)?
+            } else {
+                grinder.run(threads, nonce, limits, every, progress)?
+            };
             match outcome.hit {
                 Some(hit) => println!("{}", serde_json::to_string_pretty(&hit)?),
                 None => {
@@ -101,12 +159,32 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Bench { seconds, threads, nonce, report_every } => {
+        Command::Bench { seconds, threads, nonce, report_every, gpu: gpu_args } => {
             let threads = if threads.is_empty() { vec![logical_cpus()] } else { threads };
             let modes = if nonce.is_empty() { NonceMode::ALL.to_vec() } else { nonce };
             // A 24-character prefix: odds of a hit are 2^-120 per attempt.
             let rule = Rule { mode: Mode::Prefix, value: "a".repeat(24) };
             let grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?;
+
+            if gpu_args.gpu {
+                let gpu = gpu(&gpu_args)?;
+                eprintln!("bench: gpu for {seconds}s");
+                let limits = Limits { deadline: Some(Instant::now() + Duration::from_secs(seconds)), ..Default::default() };
+                let outcome = gpu.run(&grinder, limits, Duration::from_secs(report_every), progress)?;
+                let rate = outcome.attempts as f64 / outcome.elapsed.as_secs_f64();
+                println!(
+                    "{}",
+                    json!({
+                        "backend": "gpu",
+                        "batch": gpu_args.gpu_batch,
+                        "gpuThreads": gpu_args.gpu_threads,
+                        "seconds": outcome.elapsed.as_secs_f64(),
+                        "attempts": outcome.attempts,
+                        "rate": rate.round(),
+                    })
+                );
+                return Ok(());
+            }
 
             for (mode, threads) in modes.iter().flat_map(|m| threads.iter().map(move |t| (*m, *t))) {
                 eprintln!("bench: {mode} nonces, {threads} threads for {seconds}s");
@@ -125,6 +203,17 @@ fn main() -> Result<()> {
                     })
                 );
             }
+        }
+        Command::GpuSelftest { gpu: gpu_args, chunks } => {
+            // One character anywhere: about half of all attempts match, so both
+            // verdicts get exercised.
+            let rule = Rule { mode: Mode::Contains, value: "a".into() };
+            let grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?;
+            let report = gpu(&gpu_args)?.selftest(&grinder, chunks)?;
+            println!(
+                "ok: {} signatures from the GPU all verify with unique nonces; {} match verdicts agree with the CPU",
+                report.signatures, report.matches
+            );
         }
         Command::Profile { chunks } => {
             let rule = Rule { mode: Mode::Prefix, value: "a".repeat(24) };
