@@ -3,39 +3,30 @@
 use std::time::Duration;
 
 use plc_mint::{
-    didkey,
-    grind::{Grinder, Hit, Job},
+    example,
+    grind::{Grinder, Hit, Job, Limits, Mode, Rule},
     op,
 };
 use rand_core::OsRng;
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-fn job(mode: &str, value: &str) -> (Job, k256::ecdsa::SigningKey) {
-    let grind = k256::ecdsa::SigningKey::random(&mut OsRng);
-    let recovery = p256::ecdsa::SigningKey::random(&mut OsRng);
-    let job = json!({
-        "operation": {
-            "type": "plc_operation",
-            "rotationKeys": [
-                didkey::encode_p256(recovery.verifying_key()),
-                didkey::encode_k256(grind.verifying_key()),
-            ],
-            "verificationMethods": { "atproto": didkey::encode_k256(k256::ecdsa::SigningKey::random(&mut OsRng).verifying_key()) },
-            "alsoKnownAs": ["at://pending.example.com"],
-            "services": { "atproto_pds": { "type": "AtprotoPersonalDataServer", "endpoint": "https://pds.example.com" } },
-            "prev": null,
-        },
-        "signingKey": data_encoding::HEXLOWER.encode(&grind.to_bytes()),
-        "match": { "mode": mode, "value": value },
-    });
-    (serde_json::from_value(job).unwrap(), grind)
+fn job(mode: Mode, value: &str) -> (Job, k256::ecdsa::SigningKey) {
+    let job: Job = serde_json::from_value(example::job(&Rule { mode, value: value.into() })).unwrap();
+    let key = data_encoding::HEXLOWER.decode(job.signing_key.as_bytes()).unwrap();
+    let key = k256::ecdsa::SigningKey::from_slice(&key).unwrap();
+    (job, key)
 }
 
-fn grind(mode: &str, value: &str) -> (Hit, k256::ecdsa::SigningKey) {
+fn grind_on(threads: usize, mode: Mode, value: &str) -> (Hit, k256::ecdsa::SigningKey) {
     let (job, key) = job(mode, value);
-    let hit = Grinder::new(job).unwrap().run(Some(5_000_000), Duration::MAX, |_, _| {}).unwrap().expect("no hit");
-    (hit, key)
+    let limits = Limits { max_attempts: Some(5_000_000), ..Default::default() };
+    let outcome = Grinder::new(job).unwrap().run(threads, limits, Duration::MAX, |_, _| {}).unwrap();
+    (outcome.hit.expect("no hit"), key)
+}
+
+fn grind(mode: Mode, value: &str) -> (Hit, k256::ecdsa::SigningKey) {
+    grind_on(1, mode, value)
 }
 
 /// Verifies with libsecp256k1, which shares no code with the RustCrypto signer and
@@ -53,7 +44,7 @@ fn verify_with_libsecp256k1(signed_op: &Value, key: &k256::ecdsa::SigningKey) {
 
 #[test]
 fn grinds_a_prefix() {
-    let (hit, key) = grind("prefix", "ab");
+    let (hit, key) = grind(Mode::Prefix, "ab");
     assert!(hit.did.starts_with("did:plc:ab"), "{}", hit.did);
     assert_eq!(op::did_for(&hit.signed_op).unwrap(), hit.did);
     assert_eq!(serde_ipld_dagcbor::to_vec(&hit.signed_op).unwrap(), plc_mint::cbor::encode(&hit.signed_op).unwrap());
@@ -62,32 +53,50 @@ fn grinds_a_prefix() {
 
 #[test]
 fn grinds_contains_and_suffix() {
-    let (hit, key) = grind("contains", "zz");
+    let (hit, key) = grind(Mode::Contains, "zz");
     assert!(hit.did["did:plc:".len()..].contains("zz"), "{}", hit.did);
     verify_with_libsecp256k1(&hit.signed_op, &key);
 
-    let (hit, key) = grind("suffix", "7");
+    let (hit, key) = grind(Mode::Suffix, "7");
     assert!(hit.did.ends_with('7'), "{}", hit.did);
     verify_with_libsecp256k1(&hit.signed_op, &key);
 }
 
 #[test]
+fn grinds_on_many_threads() {
+    let (hit, key) = grind_on(4, Mode::Prefix, "abc");
+    assert!(hit.did.starts_with("did:plc:abc"), "{}", hit.did);
+    assert!(hit.attempts > 0);
+    verify_with_libsecp256k1(&hit.signed_op, &key);
+}
+
+#[test]
+fn stops_at_the_deadline() {
+    let (job, _) = job(Mode::Prefix, &"a".repeat(24));
+    let limits = Limits { deadline: Some(std::time::Instant::now() + Duration::from_millis(200)), ..Default::default() };
+    let outcome = Grinder::new(job).unwrap().run(2, limits, Duration::MAX, |_, _| {}).unwrap();
+    assert!(outcome.hit.is_none());
+    assert!(outcome.attempts > 0);
+    assert!(outcome.elapsed < Duration::from_secs(2));
+}
+
+#[test]
 fn rejects_impossible_characters() {
     for value in ["miguel0", "abc1", "8", "ABC", ""] {
-        assert!(Grinder::new(job("prefix", value).0).is_err(), "{value} should be rejected");
+        assert!(Grinder::new(job(Mode::Prefix, value).0).is_err(), "{value} should be rejected");
     }
 }
 
 #[test]
 fn rejects_a_key_outside_rotation_keys() {
-    let (mut job, _) = job("prefix", "a");
+    let (mut job, _) = job(Mode::Prefix, "a");
     job.signing_key = data_encoding::HEXLOWER.encode(&k256::ecdsa::SigningKey::random(&mut OsRng).to_bytes());
     assert!(Grinder::new(job).is_err());
 }
 
 #[test]
 fn rejects_a_signed_op() {
-    let (mut job, _) = job("prefix", "a");
+    let (mut job, _) = job(Mode::Prefix, "a");
     job.operation["sig"] = Value::String("x".into());
     assert!(Grinder::new(job).is_err());
 }

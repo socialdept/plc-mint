@@ -1,11 +1,14 @@
-use std::{io::Read, time::Duration};
+use std::{
+    io::Read,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use data_encoding::HEXLOWER;
 use plc_mint::{
-    didkey,
-    grind::{Grinder, Job, Mode, Rule},
+    didkey, example,
+    grind::{Grinder, Job, Limits, Mode, Rule},
     op,
 };
 use rand_core::OsRng;
@@ -25,12 +28,32 @@ enum Command {
         /// Job file, or - for stdin.
         #[arg(long)]
         job: String,
+        /// Worker threads. Defaults to every logical CPU.
+        #[arg(long)]
+        threads: Option<usize>,
         /// Seconds between progress lines on stderr.
         #[arg(long, default_value_t = 5)]
         report_every: u64,
         /// Give up after this many attempts (exit code 2).
         #[arg(long)]
         max_attempts: Option<u64>,
+    },
+    /// Measure sustained attempts per second against a job that never matches.
+    Bench {
+        /// Seconds per run.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        /// Thread counts to run in turn, e.g. 1,6,12. Defaults to every logical CPU.
+        #[arg(long, value_delimiter = ',')]
+        threads: Vec<usize>,
+        /// Seconds between progress lines on stderr.
+        #[arg(long, default_value_t = 5)]
+        report_every: u64,
+    },
+    /// Time each stage of one attempt, single-threaded.
+    Profile {
+        #[arg(long, default_value_t = 20_000)]
+        iterations: u32,
     },
     /// Recompute the DID of a signed genesis op and verify its signature.
     Verify {
@@ -39,7 +62,7 @@ enum Command {
     },
     /// Generate a secp256k1 key pair.
     Keygen,
-    /// Print a throwaway job with fresh keys, for testing and benchmarks.
+    /// Print a throwaway job with fresh keys, for testing.
     ExampleJob {
         #[arg(long, value_enum, default_value = "prefix")]
         mode: ModeArg,
@@ -57,22 +80,49 @@ enum ModeArg {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Grind { job, report_every, max_attempts } => {
+        Command::Grind { job, threads, report_every, max_attempts } => {
             let job: Job = serde_json::from_str(&read_input(&job)?).context("invalid job JSON")?;
-            let mut grinder = Grinder::new(job)?;
-            let hit = grinder.run(max_attempts, Duration::from_secs(report_every), |attempts, elapsed| {
-                eprintln!(
-                    "{attempts} attempts, {:.0}s, {:.0}/s",
-                    elapsed.as_secs_f64(),
-                    attempts as f64 / elapsed.as_secs_f64()
-                );
-            })?;
-            match hit {
+            let threads = threads.unwrap_or_else(logical_cpus);
+            let limits = Limits { max_attempts, ..Default::default() };
+            let outcome = Grinder::new(job)?.run(threads, limits, Duration::from_secs(report_every), progress)?;
+            match outcome.hit {
                 Some(hit) => println!("{}", serde_json::to_string_pretty(&hit)?),
                 None => {
                     eprintln!("no match within --max-attempts");
                     std::process::exit(2);
                 }
+            }
+        }
+        Command::Bench { seconds, threads, report_every } => {
+            let threads = if threads.is_empty() { vec![logical_cpus()] } else { threads };
+            // A 24-character prefix: odds of a hit are 2^-120 per attempt.
+            let rule = Rule { mode: Mode::Prefix, value: "a".repeat(24) };
+            let grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?;
+
+            for threads in threads {
+                eprintln!("bench: {threads} threads for {seconds}s");
+                let limits = Limits { deadline: Some(Instant::now() + Duration::from_secs(seconds)), ..Default::default() };
+                let outcome = grinder.run(threads, limits, Duration::from_secs(report_every), progress)?;
+                let rate = outcome.attempts as f64 / outcome.elapsed.as_secs_f64();
+                println!(
+                    "{}",
+                    json!({
+                        "threads": threads,
+                        "seconds": outcome.elapsed.as_secs_f64(),
+                        "attempts": outcome.attempts,
+                        "rate": rate.round(),
+                        "ratePerThread": (rate / threads as f64).round(),
+                    })
+                );
+            }
+        }
+        Command::Profile { iterations } => {
+            let rule = Rule { mode: Mode::Prefix, value: "a".repeat(24) };
+            let mut grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?;
+            let stages = grinder.profile(iterations)?;
+            let total = stages[0].1;
+            for (name, ns) in stages {
+                println!("{name:<32} {:>9.0} ns  {:>5.1}%", ns, ns / total * 100.0);
             }
         }
         Command::Verify { file } => {
@@ -105,32 +155,22 @@ fn main() -> Result<()> {
                 ModeArg::Contains => Mode::Contains,
                 ModeArg::Suffix => Mode::Suffix,
             };
-            // Stand-ins for the real roles: customer recovery key (P-256), per-job
-            // grind key and temp signing key (k256). Only the grind key is kept.
-            let recovery = p256::ecdsa::SigningKey::random(&mut OsRng);
-            let grind = k256::ecdsa::SigningKey::random(&mut OsRng);
-            let temp_signing = k256::ecdsa::SigningKey::random(&mut OsRng);
-            let job = json!({
-                "operation": {
-                    "type": "plc_operation",
-                    "rotationKeys": [
-                        didkey::encode_p256(recovery.verifying_key()),
-                        didkey::encode_k256(grind.verifying_key()),
-                    ],
-                    "verificationMethods": { "atproto": didkey::encode_k256(temp_signing.verifying_key()) },
-                    "alsoKnownAs": ["at://pending.example.com"],
-                    "services": {
-                        "atproto_pds": { "type": "AtprotoPersonalDataServer", "endpoint": "https://pds.example.com" }
-                    },
-                    "prev": null,
-                },
-                "signingKey": HEXLOWER.encode(&grind.to_bytes()),
-                "match": Rule { mode, value },
-            });
-            println!("{}", serde_json::to_string_pretty(&job)?);
+            println!("{}", serde_json::to_string_pretty(&example::job(&Rule { mode, value }))?);
         }
     }
     Ok(())
+}
+
+fn progress(attempts: u64, elapsed: Duration) {
+    eprintln!(
+        "{attempts} attempts, {:.0}s, {:.0}/s",
+        elapsed.as_secs_f64(),
+        attempts as f64 / elapsed.as_secs_f64()
+    );
+}
+
+fn logical_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 fn read_input(path: &str) -> Result<String> {

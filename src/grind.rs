@@ -1,6 +1,13 @@
 //! The grinder: re-sign a fixed genesis op with fresh nonces until its DID matches.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use data_encoding::{BASE64URL_NOPAD, Encoding, HEXLOWER_PERMISSIVE};
@@ -17,6 +24,10 @@ const MAX_OP_BYTES: usize = 7500;
 /// base64url of a 64-byte `r || s` signature.
 const SIG_LEN: usize = 86;
 const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz234567";
+/// Attempts a worker makes between checks of the shared stop flag.
+const BATCH: u64 = 1024;
+/// How often the coordinating thread checks limits and reports progress.
+const POLL: Duration = Duration::from_millis(20);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +84,21 @@ pub struct Hit {
     pub rate: f64,
 }
 
+/// When to give up without a hit. Both are checked with up to `threads * BATCH`
+/// attempts of overshoot.
+#[derive(Default)]
+pub struct Limits {
+    pub max_attempts: Option<u64>,
+    pub deadline: Option<Instant>,
+}
+
+pub struct Outcome {
+    pub hit: Option<Hit>,
+    pub attempts: u64,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone)]
 pub struct Grinder {
     key: SigningKey,
     op: Value,
@@ -143,40 +169,140 @@ impl Grinder {
         Ok(self.rule.matches(&identifier).then_some(sig_bytes))
     }
 
-    /// Grinds until a hit or `max_attempts`. `report` is called roughly every `every`.
+    /// Grinds on `threads` workers until a hit or a limit. `report` gets the running
+    /// attempt total roughly every `every`.
     pub fn run(
-        &mut self,
-        max_attempts: Option<u64>,
+        &self,
+        threads: usize,
+        limits: Limits,
         every: Duration,
         mut report: impl FnMut(u64, Duration),
-    ) -> Result<Option<Hit>> {
+    ) -> Result<Outcome> {
         let start = Instant::now();
-        let mut last_report = start;
-        let mut attempts = 0u64;
+        let stop = AtomicBool::new(false);
+        let total = AtomicU64::new(0);
+        let found: Mutex<Option<[u8; 64]>> = Mutex::new(None);
+        let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
-        loop {
-            if max_attempts.is_some_and(|max| attempts >= max) {
-                return Ok(None);
+        thread::scope(|scope| {
+            for _ in 0..threads.max(1) {
+                let mut worker = self.clone();
+                let (stop, total, found, failure) = (&stop, &total, &found, &failure);
+                scope.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut done = 0;
+                        while done < BATCH {
+                            done += 1;
+                            match worker.attempt() {
+                                Ok(None) => continue,
+                                Ok(Some(sig)) => {
+                                    found.lock().unwrap().get_or_insert(sig);
+                                }
+                                Err(e) => {
+                                    failure.lock().unwrap().get_or_insert(e);
+                                }
+                            }
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                        total.fetch_add(done, Ordering::Relaxed);
+                    }
+                });
             }
-            attempts += 1;
 
-            if let Some(sig) = self.attempt()? {
-                let elapsed = start.elapsed();
+            let mut last_report = start;
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(POLL);
+                let attempts = total.load(Ordering::Relaxed);
+                if limits.max_attempts.is_some_and(|max| attempts >= max)
+                    || limits.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                if last_report.elapsed() >= every {
+                    last_report = Instant::now();
+                    report(attempts, start.elapsed());
+                }
+            }
+        });
+
+        if let Some(e) = failure.into_inner().unwrap() {
+            return Err(e);
+        }
+        let elapsed = start.elapsed();
+        let attempts = total.into_inner();
+        let hit = match found.into_inner().unwrap() {
+            Some(sig) => {
                 let (did, signed_op) = self.finish(&sig)?;
-                return Ok(Some(Hit {
+                Some(Hit {
                     did,
                     signed_op,
                     attempts,
                     elapsed_ms: elapsed.as_millis(),
                     rate: attempts as f64 / elapsed.as_secs_f64(),
-                }));
+                })
             }
+            None => None,
+        };
+        Ok(Outcome { hit, attempts, elapsed })
+    }
 
-            if attempts.is_multiple_of(1024) && last_report.elapsed() >= every {
-                last_report = Instant::now();
-                report(attempts, start.elapsed());
+    /// Times each stage of an attempt in isolation, single-threaded, as nanoseconds
+    /// per call. Shows where the hot loop spends its time.
+    pub fn profile(&mut self, iterations: u32) -> Result<Vec<(String, f64)>> {
+        use std::hint::black_box;
+
+        use k256::{AffinePoint, ProjectivePoint, Scalar, elliptic_curve::Field};
+
+        fn time(iterations: u32, mut f: impl FnMut()) -> f64 {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                f();
             }
+            start.elapsed().as_nanos() as f64 / iterations as f64
         }
+
+        let sig: Signature = self.key.sign_prehash_with_rng(&mut OsRng, &self.digest)?;
+        let sig_bytes: [u8; 64] = sig.to_bytes().into();
+        let hash = Sha256::digest(&self.template);
+        let k = Scalar::random(&mut OsRng);
+
+        let mut stages = vec![
+            ("attempt (total)", time(iterations, || drop(black_box(self.attempt())))),
+            ("sign: RFC 6979 + entropy", time(iterations, || {
+                let sig: Result<Signature, _> = self.key.sign_prehash_with_rng(&mut OsRng, &self.digest);
+                black_box(sig).ok();
+            })),
+            ("  ec: k*G to affine", time(iterations, || {
+                black_box(AffinePoint::from(ProjectivePoint::GENERATOR * black_box(k)));
+            })),
+            ("  ec: k^-1 mod n", time(iterations, || {
+                black_box(black_box(k).invert());
+            })),
+            ("  rng: Scalar::random(OsRng)", time(iterations, || {
+                black_box(Scalar::random(&mut OsRng));
+            })),
+        ];
+        let template_len = self.template.len();
+        let (slot, base32, rule) = (self.slot, self.base32.clone(), self.rule.clone());
+        let template = &mut self.template;
+        stages.push(("base64url into slot", time(iterations, || {
+            BASE64URL_NOPAD.encode_mut(black_box(&sig_bytes), &mut template[slot..slot + SIG_LEN]);
+        })));
+        stages.push(("sha256 template", time(iterations, || {
+            black_box(Sha256::digest(black_box(&template[..])));
+        })));
+        stages.push(("base32 + match", time(iterations, || {
+            let mut identifier = [0u8; 24];
+            base32.encode_mut(&black_box(hash)[..15], &mut identifier);
+            black_box(rule.matches(&identifier));
+        })));
+
+        let sha_label = format!("sha256 template ({template_len} B)");
+        Ok(stages
+            .into_iter()
+            .map(|(name, ns)| (if name == "sha256 template" { sha_label.clone() } else { name.to_owned() }, ns))
+            .collect())
     }
 
     /// Builds the signed op from scratch and re-verifies it independently of the

@@ -17,14 +17,18 @@ cargo build --release
 B=./target/release/plc-mint
 
 $B example-job --mode prefix --value mig > job.json   # throwaway keys, for testing
-$B grind --job job.json --report-every 5              # stdout: the hit as JSON
+$B grind --job job.json --threads 10                 # stdout: the hit as JSON
+$B bench --seconds 300 --threads 1,6,12              # sustained attempts/s per thread count
+$B profile                                           # ns per stage of one attempt
 $B verify signed-op.json                              # recompute DID + check signature
 $B keygen                                             # fresh secp256k1 key pair
 ```
 
 | Command | Purpose |
 | --- | --- |
-| `grind --job <file\|->` | Grind until the DID matches. `--max-attempts N` gives up with exit code 2. Progress goes to stderr. |
+| `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--max-attempts N` gives up with exit code 2. Progress goes to stderr. |
+| `bench` | Grinds a never-matching job for `--seconds` at each of `--threads 1,6,12`, one JSON line per run: `{threads, seconds, attempts, rate, ratePerThread}`. |
+| `profile` | Times each stage of an attempt in isolation (signing, `k*G`, inversion, RNG, base64url, SHA-256, base32 + match). |
 | `verify <file\|->` | Takes a signed op, or `{did, operation}` as in a `plc.directory/:did/log/audit` entry. Prints the DID, the signing rotation key and, if given, whether it matches the expected DID. |
 | `keygen` | Prints `{privateKey (hex), didKey}` for secp256k1. |
 | `example-job` | A job with fresh stand-in keys: P-256 recovery key, k256 grind key, k256 temp signing key. |
@@ -58,4 +62,4 @@ Every hit is rebuilt from scratch (not from the hot-loop template), re-hashed an
 
 ## Status
 
-Single-threaded grinder works (phases 1 and 2). One thread signs with a fresh RFC 6979 + OS-entropy nonce per attempt, about **12.6k attempts/s** on the i7-9750H home server. Next: threads, then incremental nonces.
+Phases 1 and 2 done. Phase 3 in progress: the grinder runs one worker per thread (no shared state beyond a stop flag and an attempt counter), with `bench` and `profile` for measurement. Each attempt signs with a fresh RFC 6979 + OS-entropy nonce. One thread does about **12.6k attempts/s** on the i7-9750H home server; multi-thread numbers pending a benchmark on an idle machine. Next: cheaper nonces, then incremental nonces.
