@@ -61,7 +61,7 @@ plc-mint grind --job miguel/job.json --nonce incremental > miguel/hit.json   # C
 plc-mint grind --job miguel/job.json --gpu > miguel/hit.json                 # Apple Silicon GPU
 ```
 
-Progress goes to stderr; the hit (`{did, signedOp, attempts, elapsedMs, rate}`) to stdout. Every hit is rebuilt and re-verified from scratch before it is printed. `--nonce incremental` is 17x faster than the conservative default (see [Nonce modes](#nonce-modes) for why it is safe here and what is still unreviewed); `--gpu` uses the same algorithm.
+Progress and, at the end, the found DID go to stderr; the hit (`{did, signedOp, attempts, elapsedMs, rate}`) goes to stdout. Every hit is rebuilt and re-verified from scratch before it is printed. `--nonce incremental` is 17x faster than the conservative default (see [Nonce modes](#nonce-modes) for why it is safe here and what is still unreviewed); `--gpu` uses the same algorithm.
 
 ### 4. Claim
 

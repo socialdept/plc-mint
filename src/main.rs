@@ -185,7 +185,11 @@ fn main() -> Result<()> {
                 grinder.run(threads, nonce, limits, every, progress)?
             };
             match outcome.hit {
-                Some(hit) => println!("{}", serde_json::to_string_pretty(&hit)?),
+                Some(hit) => {
+                    println!("{}", serde_json::to_string_pretty(&hit)?);
+                    // stdout usually goes to a file; show the result on the terminal too.
+                    eprintln!("{}", hit.did);
+                }
                 None => {
                     eprintln!("no match within --max-attempts");
                     std::process::exit(2);
