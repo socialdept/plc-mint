@@ -114,11 +114,15 @@ Nonce modes at 10 threads:
 | `random` | 71,495 | 1.15x |
 | `incremental` | 1,088,388 | 17.5x |
 
-Apple M1 (incremental, 60 s runs, software SHA-256: measured before the `asm` feature was enabled for aarch64):
+Apple M1 Pro/Max (8 performance + 2 efficiency cores), `incremental`, 60 s runs:
 
-| Threads | Attempts/s | Per thread |
-| --- | --- | --- |
-| 4 | 1,769,013 | 442,253 |
-| 8 | 3,383,728 | 422,966 |
+| SHA-256 | Threads | Attempts/s | Per thread |
+| --- | --- | --- | --- |
+| software | 4 | 1,769,013 | 442,253 |
+| software | 8 | 3,383,728 | 422,966 |
+| ARMv8 (`asm`) | 8 | 7,513,453 | 939,182 |
+| ARMv8 (`asm`) | 10 | 7,573,996 | 757,400 |
+
+Hardware SHA-256 cut the hash check from 1,557 ns to 297 ns; an attempt is now ~1 µs, ~70% of it signing. The efficiency cores add ~1%.
 
 On the home server, 10 threads is the sweet spot. With `incremental`, signing is ~1 µs and SHA-256 of the 465-byte template (~2.6 µs, no SHA-NI on this CPU) is now ~70% of an attempt. The signature sits in the first block, so no midstate can be reused; multi-buffer AVX2 SHA-256 is the next lever.
