@@ -1,14 +1,18 @@
 {
-  "name": "plc-mint-e2e",
+  "name": "plc-claim",
   "private": true,
   "type": "module",
   "scripts": {
-    "e2e": "bun run e2e.ts"
+    "e2e": "bun run e2e.ts",
+    "claim": "bun run plc-claim.ts"
   },
   "dependencies": {
     "@ipld/dag-cbor": "10.0.2",
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "multiformats": "14.0.5"
+  },
+  "bin": {
+    "plc-claim": "./plc-claim.ts"
   }
 }
