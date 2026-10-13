@@ -14,5 +14,6 @@
   },
   "bin": {
     "plc-claim": "./plc-claim.ts"
-  }
+  },
+  "license": "MIT"
 }

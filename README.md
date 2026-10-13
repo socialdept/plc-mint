@@ -6,7 +6,7 @@ Grind vanity `did:plc` identifiers, then claim them as a new account on a PDS.
 
 Two tools:
 
-- **`plc-mint`** (Rust) creates keys and an unsigned did:plc genesis operation, then re-signs it with fresh ECDSA nonces until the resulting DID matches a pattern (`did:plc:miguel…`). Pure math: no network, no state.
+- **`plc-mint`** (Rust) creates keys and an unsigned did:plc genesis operation, then re-signs it with fresh ECDSA nonces until the resulting DID matches a pattern (`did:plc:alice…`). Pure math: no network, no state.
 - **`plc-claim`** (Bun) publishes the winning genesis to the PLC directory and imports the DID into a PDS as a new account, then hands the DID's signing key and endpoint over to that PDS.
 
 ## Why
@@ -31,7 +31,7 @@ cargo install --path . --features gpu     # Apple Silicon: adds --gpu (needs Xco
 
 Patterns use `a-z` and `2-7` only (no `0`, `1`, `8`, `9`). `prefix` and `suffix` cost the same; `contains` is cheaper because the string can sit at any of the 24 positions. The time to a hit is random, so these are averages: about 1 run in 20 takes 3x longer, and restarting doesn't help.
 
-| Length | Prefix / suffix attempts | Intel i7 laptop, 10 threads (~1M/s) | M1 Max CPU (~7.5M/s) | M1 Max GPU (~16M/s) |
+| Length | Prefix / suffix attempts | Intel i7-9750H, 10 threads (~1M/s) | M1 Max CPU (~7.5M/s) | M1 Max GPU (~16M/s) |
 | --- | --- | --- | --- | --- |
 | 4 | 1.0M | 1 s | instant | instant |
 | 5 | 34M | 34 s | 4.5 s | 2 s |
@@ -44,18 +44,18 @@ Patterns use `a-z` and `2-7` only (no `0`, `1`, `8`, `9`). `prefix` and `suffix`
 ### 2–3 in one go
 
 ```sh
-plc-mint mint --mode prefix --value miguel --out ./miguel --gpu   # or --nonce incremental on a CPU
+plc-mint mint --mode prefix --value alice --out ./alice --gpu   # or --nonce incremental on a CPU
 ```
 
-`mint` is `init` followed by `grind`: it writes `keys.json` and `job.json` first, then `hit.json` once it finds a match, and prints the DID. It takes the options of both. If you stop it midway, `plc-mint grind --job miguel/job.json` picks up the same job (a fresh search; the odds don't depend on how long it already ran).
+`mint` is `init` followed by `grind`: it writes `keys.json` and `job.json` first, then `hit.json` once it finds a match, and prints the DID. It takes the options of both. If you stop it midway, `plc-mint grind --job alice/job.json` picks up the same job (a fresh search; the odds don't depend on how long it already ran).
 
 **Alternatives while you wait.** For a prefix or suffix, `mint` also saves DIDs where the value lands somewhere else, as they turn up:
 
 ```
-alternative (middle): did:plc:eua3ole6imiguelups5abcd2i  -> miguel/alternatives/eua3ole6imiguelups5abcd2i.json
+alternative (middle): did:plc:eua3ole6ialicequps5abcd2i  -> alice/alternatives/eua3ole6ialicequps5abcd2i.json
 ```
 
-Positions are `start`, `end` and `middle`; the value is 15 to 20 times more likely to turn up in the middle than at a given end, so the first few arrive long before the target. Up to `--alternatives N` are kept per position (default 10, `0` turns it off). If the wait gets too long, stop the grind (Ctrl-C) and claim an alternative instead: `plc-claim --hit miguel/alternatives/<id>.json …`.
+Positions are `start`, `end` and `middle`; the value is 15 to 20 times more likely to turn up in the middle than at a given end, so the first few arrive long before the target. Up to `--alternatives N` are kept per position (default 10, `0` turns it off). If the wait gets too long, stop the grind (Ctrl-C) and claim an alternative instead: `plc-claim --hit alice/alternatives/<id>.json …`.
 
 **Claim only one DID per job.** The hit and all its alternatives share the job's keys and are signed by the same grind key with related nonces; two of them in public would reveal that key. `plc-claim` refuses to publish one when another from the same job (`hit.json` or `alternatives/` next to `keys.json`) is already on PLC. To get a second DID, run `mint` again.
 
@@ -64,7 +64,7 @@ The two steps separately:
 ### 2. Create keys and a job
 
 ```sh
-plc-mint init --mode prefix --value miguel --out ./miguel
+plc-mint init --mode prefix --value alice --out ./alice
 ```
 
 This writes two files, readable only by you, and never overwrites existing ones:
@@ -77,8 +77,8 @@ To keep the recovery key off this machine entirely, bring your own: `--recovery 
 ### 3. Grind
 
 ```sh
-plc-mint grind --job miguel/job.json --nonce incremental > miguel/hit.json   # CPU
-plc-mint grind --job miguel/job.json --gpu > miguel/hit.json                 # Apple Silicon GPU
+plc-mint grind --job alice/job.json --nonce incremental > alice/hit.json   # CPU
+plc-mint grind --job alice/job.json --gpu > alice/hit.json                 # Apple Silicon GPU
 ```
 
 Progress and, at the end, the found DID go to stderr; the hit (`{did, signedOp, attempts, elapsedMs, rate}`) goes to stdout. Every hit is rebuilt and re-verified from scratch before it is printed. `--nonce incremental` is 17x faster than the conservative default (see [Nonce modes](#nonce-modes) for why it is safe here and what is still unreviewed); `--gpu` uses the same algorithm.
@@ -88,8 +88,8 @@ Progress and, at the end, the found DID go to stderr; the hit (`{did, signedOp, 
 Pick the PDS that will host the account and a handle on one of its domains. To use your own domain as the handle, point it at the DID first (`_atproto.<domain>` TXT record `did=<did>`, or `https://<domain>/.well-known/atproto-did`); the DID is known as soon as grinding finishes.
 
 ```sh
-bun claim/plc-claim.ts --hit miguel/hit.json --keys miguel/keys.json \
-  --pds https://pds.example.com --handle miguel.pds.example.com --email you@example.com \
+bun claim/plc-claim.ts --hit alice/hit.json --keys alice/keys.json \
+  --pds https://pds.example.com --handle alice.pds.example.com --email you@example.com \
   --dry-run          # checks everything, changes nothing; drop it to run for real
 ```
 
@@ -219,9 +219,11 @@ cd claim && bun install && bun run e2e.ts [prefix]   # PLC_URL / PDS_URL overrid
 
 ## Status
 
-Phases 1–4 done, except the migration to a second PDS: the end-to-end test passes against a stock PDS, and `init` + `plc-claim` make the whole flow self-serve. Phase 3 benchmarks:
+**Viable.** Vanity DIDs ground with plc-mint have been claimed as working accounts on a real, stock self-hosted PDS (invite code, no admin access), resolve through plc.directory and show up in the Bluesky app; the end-to-end test covers the same flow locally. Open items: an independent review of the `incremental` nonce scheme, and Bluesky's `bsky.social` entryway as a claim target.
 
-Measured on the i7-9750H home server (6 cores / 12 threads), `nice -n 19`, sharing the box with Herd's queue workers (~2 cores busy), 5 minutes per run.
+### Benchmarks
+
+Intel i7-9750H (6 cores / 12 threads), `nice -n 19`, sharing the machine with other workloads (~2 cores busy), 5 minutes per run.
 
 Thread scaling (`rfc6979`):
 
@@ -250,4 +252,4 @@ Apple M1 Pro/Max (8 performance + 2 efficiency cores), `incremental`, 60 s runs:
 
 Hardware SHA-256 cut the hash check from 1,557 ns to 297 ns; an attempt is now ~1 µs, ~70% of it signing. The efficiency cores add ~1%.
 
-On the home server, 10 threads is the sweet spot. With `incremental`, signing is ~1 µs and SHA-256 of the 465-byte template (~2.6 µs, no SHA-NI on this CPU) is now ~70% of an attempt. The signature sits in the first block, so no midstate can be reused; multi-buffer AVX2 SHA-256 is the next lever.
+On the i7-9750H, 10 threads is the sweet spot. With `incremental`, signing is ~1 µs and SHA-256 of the 465-byte template (~2.6 µs, no SHA-NI on this CPU) is now ~70% of an attempt. The signature sits in the first block, so no midstate can be reused; multi-buffer AVX2 SHA-256 is the next lever.

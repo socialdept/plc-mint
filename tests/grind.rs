@@ -1,4 +1,4 @@
-//! Phase 2 gate: grind a match and have a second library verify the result.
+//! Grind a match and have a second library verify the result.
 
 use std::time::Duration;
 
@@ -134,7 +134,7 @@ fn stops_at_the_deadline() {
 
 #[test]
 fn rejects_impossible_characters() {
-    for value in ["miguel0", "abc1", "8", "ABC", ""] {
+    for value in ["alice0", "abc1", "8", "ABC", ""] {
         assert!(Grinder::new(job(Mode::Prefix, value).0).is_err(), "{value} should be rejected");
     }
 }

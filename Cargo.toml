@@ -2,6 +2,9 @@
 name = "plc-mint"
 version = "0.1.0"
 edition = "2024"
+description = "Grind vanity did:plc identifiers on your CPU or Apple GPU"
+license = "MIT"
+repository = "https://github.com/socialdept/plc-mint"
 
 [dependencies]
 anyhow = "1.0.104"

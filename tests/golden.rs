@@ -1,4 +1,4 @@
-//! Phase 1 gate: reproduce real DIDs from their genesis ops, byte for byte.
+//! Reproduce real DIDs from their genesis ops, byte for byte.
 
 use plc_mint::{cbor, op};
 use serde_json::Value;
