@@ -62,4 +62,12 @@ Every hit is rebuilt from scratch (not from the hot-loop template), re-hashed an
 
 ## Status
 
-Phases 1 and 2 done. Phase 3 in progress: the grinder runs one worker per thread (no shared state beyond a stop flag and an attempt counter), with `bench` and `profile` for measurement. Each attempt signs with a fresh RFC 6979 + OS-entropy nonce. One thread does about **12.6k attempts/s** on the i7-9750H home server; multi-thread numbers pending a benchmark on an idle machine. Next: cheaper nonces, then incremental nonces.
+Phases 1 and 2 done. Phase 3 in progress: the grinder runs one worker per thread (no shared state beyond a stop flag and an attempt counter), with `bench` and `profile` for measurement. Each attempt signs with a fresh RFC 6979 + OS-entropy nonce. Measured on the i7-9750H home server (6 cores / 12 threads), `nice -n 19`, sharing the box with Herd's queue workers (~2 cores busy), 5 minutes per run:
+
+| Threads | Attempts/s | Per thread |
+| --- | --- | --- |
+| 6 | 50,197 | 8,366 |
+| 10 | 57,919 | 5,792 |
+| 12 | 57,767 | 4,814 |
+
+10 threads is the sweet spot; hyperthreads past that add nothing. `profile` puts ~96% of an attempt in ECDSA signing and ~3.6% in SHA-256, so the next step is cheaper nonces, then incremental nonces.
