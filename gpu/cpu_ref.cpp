@@ -29,3 +29,25 @@ extern "C" void plcmint_ref_run(const Params* params, uint* state, uint threads,
         }
     }
 }
+
+// One kernel arithmetic op on little-endian limbs, for tests:
+// 0 fmul, 1 fsqr, 2 finv, 3 smul, 4 ssqr, 5 sinv, 6 fadd, 7 fsub, 8 sadd.
+extern "C" void plcmint_ref_op(uint op, const uint* a, const uint* b, uint* out) {
+    U256 x, y, r;
+    for (int i = 0; i < 8; i++) {
+        x.v[i] = a[i];
+        y.v[i] = b[i];
+    }
+    switch (op) {
+        case 0: r = fmul(x, y); break;
+        case 1: r = fsqr(x); break;
+        case 2: r = finv(x); break;
+        case 3: r = smul(x, y); break;
+        case 4: r = ssqr(x); break;
+        case 5: r = sinv(x); break;
+        case 6: r = fadd(x, y); break;
+        case 7: r = fsub(x, y); break;
+        default: r = sadd(x, y); break;
+    }
+    for (int i = 0; i < 8; i++) out[i] = r.v[i];
+}

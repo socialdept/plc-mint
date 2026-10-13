@@ -75,7 +75,9 @@ $B bench --gpu --seconds 60 [--gpu-batch 32] [--gpu-threads 16384]
 $B grind --job job.json --gpu
 ```
 
-The same kernel source compiles as C++ (`gpu/cpu_ref.cpp`), so its math is tested on any machine: `cargo test --features gpu-ref` checks that every signature verifies, uses exactly nonce `k_thread + i`, and gets the CPU's match verdict, across dispatches.
+The same kernel source compiles as C++ (`gpu/cpu_ref.cpp`), so its math is tested on any machine: `cargo test --features gpu-ref` checks that every signature verifies, uses exactly nonce `k_thread + i`, and gets the CPU's match verdict, across dispatches. It also checks every field and scalar operation (multiply, square, add, subtract, inverse) against k256 on edge values and 3,000 random inputs each.
+
+Kernel arithmetic: 8 x 32-bit limbs; a straight-line reduction specialized for p = 2^256 - 2^32 - 977; dedicated squaring (36 partial products instead of 64); field inversion by libsecp256k1's addition chain (255 squarings, 15 multiplications); scalar inversion with a 4-bit window; SHA-256 schedules of the six constant blocks precomputed on the host.
 
 ### Correctness
 

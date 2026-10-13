@@ -39,6 +39,7 @@ pub struct Params {
     pub chunks: u32,
     pub debug: u32,
     pub value: [u32; 24],
+    pub sched: [u32; 384],
 }
 
 /// Big-endian 32 bytes to little-endian 32-bit limbs.
@@ -79,7 +80,26 @@ pub fn params(grinder: &Grinder, chunks: u32, debug: bool) -> Result<Params> {
         chunks,
         debug: debug as u32,
         value,
+        sched: constant_schedules(&msg),
     })
+}
+
+/// SHA-256 message schedules (64 words each) of blocks 2..7, which never change
+/// between attempts, so the kernel only runs their rounds.
+fn constant_schedules(msg: &[u8]) -> [u32; 384] {
+    let mut out = [0u32; 384];
+    for (blk, sched) in out.chunks_exact_mut(64).enumerate() {
+        let block = &msg[(blk + 2) * 64..(blk + 3) * 64];
+        for t in 0..16 {
+            sched[t] = u32::from_be_bytes(block[4 * t..4 * t + 4].try_into().unwrap());
+        }
+        for t in 16..64 {
+            let s0 = sched[t - 15].rotate_right(7) ^ sched[t - 15].rotate_right(18) ^ (sched[t - 15] >> 3);
+            let s1 = sched[t - 2].rotate_right(17) ^ sched[t - 2].rotate_right(19) ^ (sched[t - 2] >> 10);
+            sched[t] = sched[t - 16].wrapping_add(s0).wrapping_add(sched[t - 7]).wrapping_add(s1);
+        }
+    }
+    out
 }
 
 /// Starting nonce and point for every GPU thread. Thread t starts at
@@ -159,6 +179,19 @@ pub mod reference {
     unsafe extern "C" {
         fn plcmint_ref_batch() -> u32;
         fn plcmint_ref_run(params: *const Params, state: *mut u32, threads: u32, hit: *mut u32, dbg: *mut u32);
+        fn plcmint_ref_op(op: u32, a: *const u32, b: *const u32, out: *mut u32);
+    }
+
+    /// One kernel arithmetic op on big-endian 32-byte values. See `plcmint_ref_op`.
+    pub fn op(op: u32, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let (a, b) = (super::limbs(a), super::limbs(b));
+        let mut out = [0u32; 8];
+        unsafe { plcmint_ref_op(op, a.as_ptr(), b.as_ptr(), out.as_mut_ptr()) };
+        let mut bytes = [0u8; 32];
+        for (i, limb) in out.iter().enumerate() {
+            bytes[28 - 4 * i..32 - 4 * i].copy_from_slice(&limb.to_be_bytes());
+        }
+        bytes
     }
 
     pub fn batch() -> usize {

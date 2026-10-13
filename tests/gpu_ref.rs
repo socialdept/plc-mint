@@ -92,3 +92,85 @@ fn finds_and_records_a_hit() {
     let (_, matches) = check(Mode::Contains, "a");
     assert!(matches > 0);
 }
+
+mod arithmetic {
+    use k256::{FieldElement, Scalar, elliptic_curve::{Field, PrimeField}};
+    use plc_mint::gpu::reference::op;
+    use rand_core::OsRng;
+
+    const P_MINUS_1: &str = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2e";
+    const N_MINUS_1: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140";
+
+    fn hex32(s: &str) -> [u8; 32] {
+        data_encoding::HEXLOWER.decode(s.as_bytes()).unwrap().try_into().unwrap()
+    }
+
+    fn field_cases() -> Vec<FieldElement> {
+        let mut cases: Vec<FieldElement> = [
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            "00000000000000000000000000000000000000000000000000000001000003d1",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffe00000000",
+            "8000000000000000000000000000000000000000000000000000000000000000",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2d",
+            P_MINUS_1,
+        ]
+        .iter()
+        .map(|h| FieldElement::from_bytes(&hex32(h).into()).unwrap())
+        .collect();
+        cases.extend((0..3000).map(|_| FieldElement::random(&mut OsRng)));
+        cases
+    }
+
+    fn scalar_cases() -> Vec<Scalar> {
+        let mut cases: Vec<Scalar> = [
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            "0000000000000000000000000000000145512319 50b75fc4402da1732fc9bebf",
+            "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0",
+            N_MINUS_1,
+        ]
+        .iter()
+        .map(|h| Scalar::from_repr(hex32(&h.replace(' ', "")).into()).unwrap())
+        .collect();
+        cases.extend((0..3000).map(|_| Scalar::random(&mut OsRng)));
+        cases
+    }
+
+    fn fb(x: &FieldElement) -> [u8; 32] {
+        x.to_bytes().into()
+    }
+
+    fn sb(x: &Scalar) -> [u8; 32] {
+        x.to_bytes().into()
+    }
+
+    #[test]
+    fn field_ops_match_k256() {
+        let cases = field_cases();
+        for (i, a) in cases.iter().enumerate() {
+            let b = &cases[(i * 7 + 3) % cases.len()];
+            assert_eq!(op(0, &fb(a), &fb(b)), fb(&(*a * b).normalize()), "fmul {i}");
+            assert_eq!(op(1, &fb(a), &fb(b)), fb(&a.square().normalize()), "fsqr {i}");
+            assert_eq!(op(6, &fb(a), &fb(b)), fb(&(*a + b).normalize()), "fadd {i}");
+            assert_eq!(op(7, &fb(a), &fb(b)), fb(&(*a - b).normalize()), "fsub {i}");
+            if i % 10 == 0 {
+                assert_eq!(op(2, &fb(a), &fb(b)), fb(&a.invert().unwrap().normalize()), "finv {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_ops_match_k256() {
+        let cases = scalar_cases();
+        for (i, a) in cases.iter().enumerate() {
+            let b = &cases[(i * 7 + 3) % cases.len()];
+            assert_eq!(op(3, &sb(a), &sb(b)), sb(&(*a * b)), "smul {i}");
+            assert_eq!(op(4, &sb(a), &sb(b)), sb(&a.square()), "ssqr {i}");
+            assert_eq!(op(8, &sb(a), &sb(b)), sb(&(*a + b)), "sadd {i}");
+            if i % 10 == 0 {
+                assert_eq!(op(5, &sb(a), &sb(b)), sb(&a.invert().unwrap()), "sinv {i}");
+            }
+        }
+    }
+}

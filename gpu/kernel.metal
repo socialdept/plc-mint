@@ -39,14 +39,14 @@ struct Params {
     uint chunks;      // chunks of BATCH attempts per thread per dispatch
     uint debug;       // nonzero: write every attempt to dbg
     uint value[24];   // match characters
+    uint sched[384];  // SHA-256 message schedules (64 words) of the constant blocks 2..7
 };
 
 struct U256 { uint v[8]; };
 
 // secp256k1 field prime p = 2^256 - (2^32 + 977) and group order n = 2^256 - c_n.
+// The field has its own reduction (reduce_p); scalars use the generic reduce512.
 CONST uint P_MOD[8] = {0xFFFFFC2F, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
-CONST uint P_C[2] = {0x000003D1, 0x00000001};
-CONST uint P_EXP[8] = {0xFFFFFC2D, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 CONST uint N_MOD[8] = {0xD0364141, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 CONST uint N_C[5] = {0x2FC9BEBF, 0x402DA173, 0x50B75FC4, 0x45512319, 0x00000001};
 CONST uint N_EXP[8] = {0xD036413F, 0xBFD25E8C, 0xAF48A03B, 0xBAAEDCE6, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
@@ -164,20 +164,6 @@ inline U256 reduce512(LOCAL uint* w, CONST uint* c, int cl, CONST uint* m) {
     return r;
 }
 
-inline U256 mul_mod(U256 a, U256 b, CONST uint* c, int cl, CONST uint* m) {
-    uint w[16];
-    for (int i = 0; i < 16; i++) w[i] = 0;
-    for (int i = 0; i < 8; i++) {
-        ulong carry = 0;
-        for (int j = 0; j < 8; j++) {
-            ulong t = (ulong)a.v[i] * (ulong)b.v[j] + (ulong)w[i + j] + carry;
-            w[i + j] = (uint)t;
-            carry = t >> 32;
-        }
-        w[i + 8] = (uint)carry;
-    }
-    return reduce512(w, c, cl, m);
-}
 
 // Inputs must already be < m.
 inline U256 add_mod(U256 a, U256 b, CONST uint* m) {
@@ -194,27 +180,155 @@ inline U256 sub_mod(U256 a, U256 b, CONST uint* m) {
     return r;
 }
 
-inline U256 fmul(U256 a, U256 b) { return mul_mod(a, b, P_C, 2, P_MOD); }
-inline U256 fadd(U256 a, U256 b) { return add_mod(a, b, P_MOD); }
-inline U256 fsub(U256 a, U256 b) { return sub_mod(a, b, P_MOD); }
-inline U256 smul(U256 a, U256 b) { return mul_mod(a, b, N_C, 5, N_MOD); }
-inline U256 sadd(U256 a, U256 b) { return add_mod(a, b, N_MOD); }
-
-// a^(m-2) by square-and-multiply: the inverse, by Fermat.
-inline U256 finv(U256 a) {
-    U256 r = u_small(1);
-    for (int i = 255; i >= 0; i--) {
-        r = fmul(r, r);
-        if ((P_EXP[i >> 5] >> (i & 31)) & 1) r = fmul(r, a);
+// Reduces w[16] mod p = 2^256 - 0x1000003D1 in straight-line code:
+// hi * 2^256 = hi * 977 + hi * 2^32.
+inline U256 reduce_p(LOCAL uint* w) {
+    uint r[8];
+    ulong c = 0;
+    for (int i = 0; i < 8; i++) {
+        c += (ulong)w[i] + (ulong)w[8 + i] * 977u;
+        if (i > 0) c += (ulong)w[7 + i];
+        r[i] = (uint)c;
+        c >>= 32;
     }
-    return r;
+    c += (ulong)w[15];
+    // Fold the remaining carry (< 2^34) the same way.
+    ulong t = (ulong)r[0] + c * 977u;
+    r[0] = (uint)t;
+    t >>= 32;
+    t += (ulong)r[1] + c;
+    r[1] = (uint)t;
+    t >>= 32;
+    for (int i = 2; i < 8; i++) {
+        t += (ulong)r[i];
+        r[i] = (uint)t;
+        t >>= 32;
+    }
+    if (t != 0) {
+        // Wrapped past 2^256 once more; r is now tiny, so this cannot carry far.
+        ulong u = (ulong)r[0] + 977u;
+        r[0] = (uint)u;
+        u = (ulong)r[1] + 1u + (u >> 32);
+        r[1] = (uint)u;
+        for (int i = 2; i < 8 && (u >> 32) != 0; i++) {
+            u = (ulong)r[i] + (u >> 32);
+            r[i] = (uint)u;
+        }
+    }
+    U256 out;
+    for (int i = 0; i < 8; i++) out.v[i] = r[i];
+    if (u_gte(out, P_MOD)) {
+        uint b;
+        out = u_sub(out, u_load(P_MOD), b);
+    }
+    return out;
 }
 
+inline void mul_wide(U256 a, U256 b, LOCAL uint* w) {
+    for (int i = 0; i < 16; i++) w[i] = 0;
+    for (int i = 0; i < 8; i++) {
+        ulong carry = 0;
+        for (int j = 0; j < 8; j++) {
+            ulong t = (ulong)a.v[i] * (ulong)b.v[j] + (ulong)w[i + j] + carry;
+            w[i + j] = (uint)t;
+            carry = t >> 32;
+        }
+        w[i + 8] = (uint)carry;
+    }
+}
+
+// a^2 with 36 partial products: off-diagonal terms once, doubled, plus squares.
+inline void sqr_wide(U256 a, LOCAL uint* w) {
+    for (int i = 0; i < 16; i++) w[i] = 0;
+    for (int i = 0; i < 7; i++) {
+        ulong carry = 0;
+        for (int j = i + 1; j < 8; j++) {
+            ulong t = (ulong)a.v[i] * (ulong)a.v[j] + (ulong)w[i + j] + carry;
+            w[i + j] = (uint)t;
+            carry = t >> 32;
+        }
+        w[i + 8] = (uint)carry;
+    }
+    uint top = 0;
+    for (int i = 0; i < 16; i++) {
+        uint next = w[i] >> 31;
+        w[i] = (w[i] << 1) | top;
+        top = next;
+    }
+    ulong carry = 0;
+    for (int i = 0; i < 8; i++) {
+        ulong sq = (ulong)a.v[i] * (ulong)a.v[i];
+        ulong lo = (ulong)w[2 * i] + (sq & 0xFFFFFFFFul) + carry;
+        w[2 * i] = (uint)lo;
+        ulong hi = (ulong)w[2 * i + 1] + (sq >> 32) + (lo >> 32);
+        w[2 * i + 1] = (uint)hi;
+        carry = hi >> 32;
+    }
+}
+
+inline U256 fmul(U256 a, U256 b) {
+    uint w[16];
+    mul_wide(a, b, w);
+    return reduce_p(w);
+}
+
+inline U256 fsqr(U256 a) {
+    uint w[16];
+    sqr_wide(a, w);
+    return reduce_p(w);
+}
+
+inline U256 smul(U256 a, U256 b) {
+    uint w[16];
+    mul_wide(a, b, w);
+    return reduce512(w, N_C, 5, N_MOD);
+}
+
+inline U256 ssqr(U256 a) {
+    uint w[16];
+    sqr_wide(a, w);
+    return reduce512(w, N_C, 5, N_MOD);
+}
+inline U256 fadd(U256 a, U256 b) { return add_mod(a, b, P_MOD); }
+inline U256 fsub(U256 a, U256 b) { return sub_mod(a, b, P_MOD); }
+inline U256 sadd(U256 a, U256 b) { return add_mod(a, b, N_MOD); }
+
+inline U256 fsqr_n(U256 a, int n) {
+    for (int i = 0; i < n; i++) a = fsqr(a);
+    return a;
+}
+
+// a^(p-2) = a^-1 via libsecp256k1's addition chain: 255 squarings, 15 multiplications.
+// p-2 is 223 ones, a zero, 22 ones, then 0000101101.
+inline U256 finv(U256 a) {
+    U256 x2 = fmul(fsqr(a), a);
+    U256 x3 = fmul(fsqr(x2), a);
+    U256 x6 = fmul(fsqr_n(x3, 3), x3);
+    U256 x9 = fmul(fsqr_n(x6, 3), x3);
+    U256 x11 = fmul(fsqr_n(x9, 2), x2);
+    U256 x22 = fmul(fsqr_n(x11, 11), x11);
+    U256 x44 = fmul(fsqr_n(x22, 22), x22);
+    U256 x88 = fmul(fsqr_n(x44, 44), x44);
+    U256 x176 = fmul(fsqr_n(x88, 88), x88);
+    U256 x220 = fmul(fsqr_n(x176, 44), x44);
+    U256 x223 = fmul(fsqr_n(x220, 3), x3);
+    U256 t = fmul(fsqr_n(x223, 23), x22);
+    t = fmul(fsqr_n(t, 5), a);
+    t = fmul(fsqr_n(t, 3), x2);
+    return fmul(fsqr_n(t, 2), a);
+}
+
+// a^(n-2) = a^-1 with a fixed 4-bit window: 252 squarings, ~78 multiplications.
 inline U256 sinv(U256 a) {
-    U256 r = u_small(1);
-    for (int i = 255; i >= 0; i--) {
-        r = smul(r, r);
-        if ((N_EXP[i >> 5] >> (i & 31)) & 1) r = smul(r, a);
+    U256 table[16];
+    table[0] = u_small(1);
+    table[1] = a;
+    for (int i = 2; i < 16; i++) table[i] = smul(table[i - 1], a);
+    U256 r = table[N_EXP[7] >> 28];
+    for (int nib = 62; nib >= 0; nib--) {
+        for (int i = 0; i < 4; i++) r = ssqr(r);
+        uint d = (N_EXP[nib >> 3] >> ((nib & 7) * 4)) & 15;
+        if (d != 0) r = smul(r, table[d]);
     }
     return r;
 }
@@ -226,16 +340,16 @@ struct Jac { U256 x, y, z; };
 // Jacobian P + affine G. Valid while P != +-G, i.e. for any nonce other than +-1.
 inline Jac add_g(Jac p) {
     U256 gx = u_load(G_X), gy = u_load(G_Y);
-    U256 z1z1 = fmul(p.z, p.z);
+    U256 z1z1 = fsqr(p.z);
     U256 u2 = fmul(gx, z1z1);
     U256 s2 = fmul(gy, fmul(p.z, z1z1));
     U256 h = fsub(u2, p.x);
     U256 r = fsub(s2, p.y);
-    U256 hh = fmul(h, h);
+    U256 hh = fsqr(h);
     U256 hhh = fmul(h, hh);
     U256 v = fmul(p.x, hh);
     Jac o;
-    o.x = fsub(fsub(fsub(fmul(r, r), hhh), v), v);
+    o.x = fsub(fsub(fsub(fsqr(r), hhh), v), v);
     o.y = fsub(fmul(r, fsub(v, o.x)), fmul(p.y, hhh));
     o.z = fmul(p.z, h);
     return o;
@@ -252,6 +366,17 @@ inline void sha_block(LOCAL uint* h, LOCAL uint* w) {
         uint s1 = ror32(w[t - 2], 17) ^ ror32(w[t - 2], 19) ^ (w[t - 2] >> 10);
         w[t] = w[t - 16] + s0 + w[t - 7] + s1;
     }
+    uint a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int t = 0; t < 64; t++) {
+        uint t1 = hh + (ror32(e, 6) ^ ror32(e, 11) ^ ror32(e, 25)) + ((e & f) ^ (~e & g)) + SHA_K[t] + w[t];
+        uint t2 = (ror32(a, 2) ^ ror32(a, 13) ^ ror32(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+// Rounds only, for a block whose 64-word schedule was precomputed on the host.
+inline void sha_rounds_const(LOCAL uint* h, CONST uint* w) {
     uint a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
     for (int t = 0; t < 64; t++) {
         uint t1 = hh + (ror32(e, 6) ^ ror32(e, 11) ^ ror32(e, 25)) + ((e & f) ^ (~e & g)) + SHA_K[t] + w[t];
@@ -299,10 +424,11 @@ inline bool check(CONST Params& P, U256 r, U256 s) {
     uint h[8];
     for (int i = 0; i < 8; i++) h[i] = SHA_H0[i];
     uint w[64];
-    for (int blk = 0; blk < 8; blk++) {
-        for (int i = 0; i < 16; i++) w[i] = blk < 2 ? msg[blk * 16 + i] : P.tmpl[blk * 16 + i];
+    for (int blk = 0; blk < 2; blk++) {
+        for (int i = 0; i < 16; i++) w[i] = msg[blk * 16 + i];
         sha_block(h, w);
     }
+    for (int blk = 2; blk < 8; blk++) sha_rounds_const(h, P.sched + (blk - 2) * 64);
 
     // First 15 bytes of the hash as 24 base32 characters.
     uint id[24];
@@ -399,7 +525,7 @@ inline void run_thread(CONST Params& P, LOCAL U256& k, LOCAL U256& x, LOCAL U256
 
         for (int i = 0; i < BATCH; i++) {
             U256 zinv = Z[i];
-            U256 r = fmul(X[i], fmul(zinv, zinv));
+            U256 r = fmul(X[i], fsqr(zinv));
             if (u_gte(r, N_MOD)) {
                 uint b;
                 r = u_sub(r, u_load(N_MOD), b);
@@ -424,7 +550,7 @@ inline void run_thread(CONST Params& P, LOCAL U256& k, LOCAL U256& x, LOCAL U256
         }
 
         // Advance to the next chunk: affine R_BATCH and k + BATCH.
-        U256 zl2 = fmul(zl, zl);
+        U256 zl2 = fsqr(zl);
         x = fmul(cur.x, zl2);
         y = fmul(cur.y, fmul(zl2, zl));
         k = sadd(k, u_small(BATCH));

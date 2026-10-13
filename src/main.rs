@@ -100,7 +100,7 @@ struct GpuArgs {
     #[arg(long, default_value_t = 32)]
     gpu_batch: usize,
     /// GPU: threads per dispatch.
-    #[arg(long, default_value_t = 16384)]
+    #[arg(long, default_value_t = 65536)]
     gpu_threads: usize,
 }
 
