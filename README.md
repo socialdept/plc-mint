@@ -17,18 +17,18 @@ cargo build --release
 B=./target/release/plc-mint
 
 $B example-job --mode prefix --value mig > job.json   # throwaway keys, for testing
-$B grind --job job.json --threads 10                 # stdout: the hit as JSON
-$B bench --seconds 300 --threads 1,6,12              # sustained attempts/s per thread count
-$B profile                                           # ns per stage of one attempt
+$B grind --job job.json --threads 10 --nonce random  # stdout: the hit as JSON
+$B bench --seconds 300 --threads 10                  # sustained attempts/s, every nonce mode
+$B profile                                           # ns per signature per nonce mode, and per hash check
 $B verify signed-op.json                              # recompute DID + check signature
 $B keygen                                             # fresh secp256k1 key pair
 ```
 
 | Command | Purpose |
 | --- | --- |
-| `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--max-attempts N` gives up with exit code 2. Progress goes to stderr. |
-| `bench` | Grinds a never-matching job for `--seconds` at each of `--threads 1,6,12`, one JSON line per run: `{threads, seconds, attempts, rate, ratePerThread}`. |
-| `profile` | Times each stage of an attempt in isolation (signing, `k*G`, inversion, RNG, base64url, SHA-256, base32 + match). |
+| `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--nonce MODE` (default `rfc6979`), `--max-attempts N` gives up with exit code 2. Progress goes to stderr. |
+| `bench` | Grinds a never-matching job for `--seconds` at every combination of `--nonce a,b` (default: all) and `--threads 1,6,12`, one JSON line per run: `{nonce, threads, seconds, attempts, rate, ratePerThread}`. |
+| `profile` | Single-threaded ns per signature for each nonce mode, ns per hash check, and the resulting attempts/s per thread. |
 | `verify <file\|->` | Takes a signed op, or `{did, operation}` as in a `plc.directory/:did/log/audit` entry. Prints the DID, the signing rotation key and, if given, whether it matches the expected DID. |
 | `keygen` | Prints `{privateKey (hex), didKey}` for secp256k1. |
 | `example-job` | A job with fresh stand-in keys: P-256 recovery key, k256 grind key, k256 temp signing key. |
@@ -52,17 +52,32 @@ $B keygen                                             # fresh secp256k1 key pair
 
 Output: `{did, signedOp, attempts, elapsedMs, rate}`. The match value may only use `a-z` and `2-7`.
 
+### Nonce modes
+
+Every mode signs the same digest with the same key and yields valid, low-S signatures; they differ in how the nonce `k` is chosen.
+
+| Mode | Nonce | Per signature |
+| --- | --- | --- |
+| `rfc6979` | RFC 6979 + OS entropy, via the library's standard signer | one full signing operation |
+| `random` | Uniform from a per-thread ChaCha20 CSPRNG, via the library's low-level signing primitive | one `k*G` (precomputed table) + two inversions |
+| `incremental` | `k = k0 + i` from a per-thread CSPRNG start | one point addition; affine conversion and `k^-1` batched over 256 signatures (Montgomery's trick) |
+
+**`incremental` is only safe because exactly one signature per job is ever published.** Two published signatures with related nonces on the same message reveal the grind key. Losing signatures are never logged, stored or returned; a grind key must never be reused across jobs. It needs an ECDSA-literate review before production, which is why `grind` defaults to `rfc6979`.
+
 ### Correctness
 
 Every hit is rebuilt from scratch (not from the hot-loop template), re-hashed and re-verified before it is printed. Tests (`cargo test`):
 
 - **Golden:** reproduce real DIDs from their `plc.directory` genesis ops byte for byte and verify their signatures (`tests/fixtures/`).
 - **Encoder:** the DAG-CBOR encoder agrees with `serde_ipld_dagcbor`.
-- **Grind:** ground ops verify under libsecp256k1, which shares no code with the RustCrypto signer and rejects high-S.
+- **Grind:** ground ops from every nonce mode verify under libsecp256k1, which shares no code with the RustCrypto signer and rejects high-S.
+- **Signers:** every signature a signer emits, not just hits, verifies under libsecp256k1 and is unique, across batch boundaries; separate signers never share nonces.
 
 ## Status
 
-Phases 1 and 2 done. Phase 3 in progress: the grinder runs one worker per thread (no shared state beyond a stop flag and an attempt counter), with `bench` and `profile` for measurement. Each attempt signs with a fresh RFC 6979 + OS-entropy nonce. Measured on the i7-9750H home server (6 cores / 12 threads), `nice -n 19`, sharing the box with Herd's queue workers (~2 cores busy), 5 minutes per run:
+Phases 1–3 done. Measured on the i7-9750H home server (6 cores / 12 threads), `nice -n 19`, sharing the box with Herd's queue workers (~2 cores busy), 5 minutes per run.
+
+Thread scaling (`rfc6979`):
 
 | Threads | Attempts/s | Per thread |
 | --- | --- | --- |
@@ -70,4 +85,12 @@ Phases 1 and 2 done. Phase 3 in progress: the grinder runs one worker per thread
 | 10 | 57,919 | 5,792 |
 | 12 | 57,767 | 4,814 |
 
-10 threads is the sweet spot; hyperthreads past that add nothing. `profile` puts ~96% of an attempt in ECDSA signing and ~3.6% in SHA-256, so the next step is cheaper nonces, then incremental nonces.
+Nonce modes at 10 threads:
+
+| Mode | Attempts/s | vs `rfc6979` |
+| --- | --- | --- |
+| `rfc6979` | 62,286 | 1x |
+| `random` | 71,495 | 1.15x |
+| `incremental` | 1,088,388 | 17.5x |
+
+10 threads is the sweet spot. With `incremental`, signing is ~1 µs and SHA-256 of the 465-byte template (~2.6 µs, no SHA-NI on this CPU) is now ~70% of an attempt. The signature sits in the first block, so no midstate can be reused; multi-buffer AVX2 SHA-256 is the next lever.

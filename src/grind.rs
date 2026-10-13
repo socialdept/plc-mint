@@ -11,21 +11,21 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use data_encoding::{BASE64URL_NOPAD, Encoding, HEXLOWER_PERMISSIVE};
-use k256::ecdsa::{Signature, SigningKey, signature::hazmat::RandomizedPrehashSigner};
-use rand_core::OsRng;
+use k256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{cbor, didkey, op};
+use crate::{
+    cbor, didkey, op,
+    signer::{CHUNK, NonceMode, Signer},
+};
 
 /// Signed ops above this size are rejected by the PLC directory.
 const MAX_OP_BYTES: usize = 7500;
 /// base64url of a 64-byte `r || s` signature.
 const SIG_LEN: usize = 86;
 const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz234567";
-/// Attempts a worker makes between checks of the shared stop flag.
-const BATCH: u64 = 1024;
 /// How often the coordinating thread checks limits and reports progress.
 const POLL: Duration = Duration::from_millis(20);
 
@@ -84,7 +84,7 @@ pub struct Hit {
     pub rate: f64,
 }
 
-/// When to give up without a hit. Both are checked with up to `threads * BATCH`
+/// When to give up without a hit. Both are checked with up to `threads * CHUNK`
 /// attempts of overshoot.
 #[derive(Default)]
 pub struct Limits {
@@ -154,19 +154,19 @@ impl Grinder {
         Ok(Self { key, op, rule: job.rule, digest, template, slot, base32: op::base32() })
     }
 
-    /// One attempt: fresh nonce, sign, hash, compare. Returns the signature on a hit.
-    pub fn attempt(&mut self) -> Result<Option<[u8; 64]>> {
-        let sig: Signature = self.key.sign_prehash_with_rng(&mut OsRng, &self.digest)?;
-        let sig = sig.normalize_s().unwrap_or(sig);
-        let sig_bytes: [u8; 64] = sig.to_bytes().into();
-
-        BASE64URL_NOPAD.encode_mut(&sig_bytes, &mut self.template[self.slot..self.slot + SIG_LEN]);
+    /// Writes `sig` into the template, hashes it and checks the identifier.
+    pub fn check(&mut self, sig: &[u8; 64]) -> bool {
+        BASE64URL_NOPAD.encode_mut(sig, &mut self.template[self.slot..self.slot + SIG_LEN]);
         let hash = Sha256::digest(&self.template);
 
         let mut identifier = [0u8; 24];
         self.base32.encode_mut(&hash[..15], &mut identifier);
+        self.rule.matches(&identifier)
+    }
 
-        Ok(self.rule.matches(&identifier).then_some(sig_bytes))
+    /// A signer for this job's key and digest. Each worker needs its own.
+    pub fn signer(&self, mode: NonceMode) -> Signer {
+        Signer::new(mode, &self.key, self.digest)
     }
 
     /// Grinds on `threads` workers until a hit or a limit. `report` gets the running
@@ -174,6 +174,7 @@ impl Grinder {
     pub fn run(
         &self,
         threads: usize,
+        nonce: NonceMode,
         limits: Limits,
         every: Duration,
         mut report: impl FnMut(u64, Duration),
@@ -189,21 +190,22 @@ impl Grinder {
                 let mut worker = self.clone();
                 let (stop, total, found, failure) = (&stop, &total, &found, &failure);
                 scope.spawn(move || {
+                    let mut signer = worker.signer(nonce);
+                    let mut sigs = [[0u8; 64]; CHUNK];
                     while !stop.load(Ordering::Relaxed) {
-                        let mut done = 0;
-                        while done < BATCH {
-                            done += 1;
-                            match worker.attempt() {
-                                Ok(None) => continue,
-                                Ok(Some(sig)) => {
-                                    found.lock().unwrap().get_or_insert(sig);
-                                }
-                                Err(e) => {
-                                    failure.lock().unwrap().get_or_insert(e);
-                                }
-                            }
+                        if let Err(e) = signer.fill(&mut sigs) {
+                            failure.lock().unwrap().get_or_insert(e);
                             stop.store(true, Ordering::Relaxed);
                             break;
+                        }
+                        let mut done = 0;
+                        for sig in &sigs {
+                            done += 1;
+                            if worker.check(sig) {
+                                found.lock().unwrap().get_or_insert(*sig);
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
                         }
                         total.fetch_add(done, Ordering::Relaxed);
                     }
@@ -247,62 +249,30 @@ impl Grinder {
         Ok(Outcome { hit, attempts, elapsed })
     }
 
-    /// Times each stage of an attempt in isolation, single-threaded, as nanoseconds
-    /// per call. Shows where the hot loop spends its time.
-    pub fn profile(&mut self, iterations: u32) -> Result<Vec<(String, f64)>> {
-        use std::hint::black_box;
+    /// Single-threaded nanoseconds per signature for each nonce mode, and per check
+    /// (base64url + SHA-256 + base32 + match). An attempt costs one of each.
+    pub fn profile(&mut self, chunks: u32) -> Result<Vec<(String, f64)>> {
+        let per_sig = |start: Instant| start.elapsed().as_nanos() as f64 / (chunks as f64 * CHUNK as f64);
+        let mut sigs = [[0u8; 64]; CHUNK];
+        let mut stages = Vec::new();
 
-        use k256::{AffinePoint, ProjectivePoint, Scalar, elliptic_curve::Field};
-
-        fn time(iterations: u32, mut f: impl FnMut()) -> f64 {
+        for mode in NonceMode::ALL {
+            let mut signer = self.signer(mode);
             let start = Instant::now();
-            for _ in 0..iterations {
-                f();
+            for _ in 0..chunks {
+                signer.fill(&mut sigs)?;
             }
-            start.elapsed().as_nanos() as f64 / iterations as f64
+            stages.push((format!("sign: {mode}"), per_sig(start)));
         }
 
-        let sig: Signature = self.key.sign_prehash_with_rng(&mut OsRng, &self.digest)?;
-        let sig_bytes: [u8; 64] = sig.to_bytes().into();
-        let hash = Sha256::digest(&self.template);
-        let k = Scalar::random(&mut OsRng);
-
-        let mut stages = vec![
-            ("attempt (total)", time(iterations, || drop(black_box(self.attempt())))),
-            ("sign: RFC 6979 + entropy", time(iterations, || {
-                let sig: Result<Signature, _> = self.key.sign_prehash_with_rng(&mut OsRng, &self.digest);
-                black_box(sig).ok();
-            })),
-            ("  ec: k*G to affine", time(iterations, || {
-                black_box(AffinePoint::from(ProjectivePoint::GENERATOR * black_box(k)));
-            })),
-            ("  ec: k^-1 mod n", time(iterations, || {
-                black_box(black_box(k).invert());
-            })),
-            ("  rng: Scalar::random(OsRng)", time(iterations, || {
-                black_box(Scalar::random(&mut OsRng));
-            })),
-        ];
-        let template_len = self.template.len();
-        let (slot, base32, rule) = (self.slot, self.base32.clone(), self.rule.clone());
-        let template = &mut self.template;
-        stages.push(("base64url into slot", time(iterations, || {
-            BASE64URL_NOPAD.encode_mut(black_box(&sig_bytes), &mut template[slot..slot + SIG_LEN]);
-        })));
-        stages.push(("sha256 template", time(iterations, || {
-            black_box(Sha256::digest(black_box(&template[..])));
-        })));
-        stages.push(("base32 + match", time(iterations, || {
-            let mut identifier = [0u8; 24];
-            base32.encode_mut(&black_box(hash)[..15], &mut identifier);
-            black_box(rule.matches(&identifier));
-        })));
-
-        let sha_label = format!("sha256 template ({template_len} B)");
-        Ok(stages
-            .into_iter()
-            .map(|(name, ns)| (if name == "sha256 template" { sha_label.clone() } else { name.to_owned() }, ns))
-            .collect())
+        let start = Instant::now();
+        for _ in 0..chunks {
+            for sig in &sigs {
+                std::hint::black_box(self.check(sig));
+            }
+        }
+        stages.push((format!("check ({} B template)", self.template.len()), per_sig(start)));
+        Ok(stages)
     }
 
     /// Builds the signed op from scratch and re-verifies it independently of the

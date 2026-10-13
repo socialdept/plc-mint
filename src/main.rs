@@ -10,6 +10,7 @@ use plc_mint::{
     didkey, example,
     grind::{Grinder, Job, Limits, Mode, Rule},
     op,
+    signer::NonceMode,
 };
 use rand_core::OsRng;
 use serde_json::{Value, json};
@@ -31,6 +32,9 @@ enum Command {
         /// Worker threads. Defaults to every logical CPU.
         #[arg(long)]
         threads: Option<usize>,
+        /// Nonce strategy: rfc6979, random or incremental.
+        #[arg(long, default_value = "rfc6979")]
+        nonce: NonceMode,
         /// Seconds between progress lines on stderr.
         #[arg(long, default_value_t = 5)]
         report_every: u64,
@@ -46,14 +50,18 @@ enum Command {
         /// Thread counts to run in turn, e.g. 1,6,12. Defaults to every logical CPU.
         #[arg(long, value_delimiter = ',')]
         threads: Vec<usize>,
+        /// Nonce strategies to run in turn. Defaults to all of them.
+        #[arg(long, value_delimiter = ',')]
+        nonce: Vec<NonceMode>,
         /// Seconds between progress lines on stderr.
         #[arg(long, default_value_t = 5)]
         report_every: u64,
     },
-    /// Time each stage of one attempt, single-threaded.
+    /// Single-threaded cost per signature for each nonce mode, and per hash check.
     Profile {
-        #[arg(long, default_value_t = 20_000)]
-        iterations: u32,
+        /// Batches of 256 signatures to time per mode.
+        #[arg(long, default_value_t = 40)]
+        chunks: u32,
     },
     /// Recompute the DID of a signed genesis op and verify its signature.
     Verify {
@@ -80,11 +88,11 @@ enum ModeArg {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Grind { job, threads, report_every, max_attempts } => {
+        Command::Grind { job, threads, nonce, report_every, max_attempts } => {
             let job: Job = serde_json::from_str(&read_input(&job)?).context("invalid job JSON")?;
             let threads = threads.unwrap_or_else(logical_cpus);
             let limits = Limits { max_attempts, ..Default::default() };
-            let outcome = Grinder::new(job)?.run(threads, limits, Duration::from_secs(report_every), progress)?;
+            let outcome = Grinder::new(job)?.run(threads, nonce, limits, Duration::from_secs(report_every), progress)?;
             match outcome.hit {
                 Some(hit) => println!("{}", serde_json::to_string_pretty(&hit)?),
                 None => {
@@ -93,20 +101,22 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Bench { seconds, threads, report_every } => {
+        Command::Bench { seconds, threads, nonce, report_every } => {
             let threads = if threads.is_empty() { vec![logical_cpus()] } else { threads };
+            let modes = if nonce.is_empty() { NonceMode::ALL.to_vec() } else { nonce };
             // A 24-character prefix: odds of a hit are 2^-120 per attempt.
             let rule = Rule { mode: Mode::Prefix, value: "a".repeat(24) };
             let grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?;
 
-            for threads in threads {
-                eprintln!("bench: {threads} threads for {seconds}s");
+            for (mode, threads) in modes.iter().flat_map(|m| threads.iter().map(move |t| (*m, *t))) {
+                eprintln!("bench: {mode} nonces, {threads} threads for {seconds}s");
                 let limits = Limits { deadline: Some(Instant::now() + Duration::from_secs(seconds)), ..Default::default() };
-                let outcome = grinder.run(threads, limits, Duration::from_secs(report_every), progress)?;
+                let outcome = grinder.run(threads, mode, limits, Duration::from_secs(report_every), progress)?;
                 let rate = outcome.attempts as f64 / outcome.elapsed.as_secs_f64();
                 println!(
                     "{}",
                     json!({
+                        "nonce": mode.to_string(),
                         "threads": threads,
                         "seconds": outcome.elapsed.as_secs_f64(),
                         "attempts": outcome.attempts,
@@ -116,13 +126,18 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Command::Profile { iterations } => {
+        Command::Profile { chunks } => {
             let rule = Rule { mode: Mode::Prefix, value: "a".repeat(24) };
             let mut grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?;
-            let stages = grinder.profile(iterations)?;
-            let total = stages[0].1;
-            for (name, ns) in stages {
-                println!("{name:<32} {:>9.0} ns  {:>5.1}%", ns, ns / total * 100.0);
+            let stages = grinder.profile(chunks)?;
+            let (_, check) = stages.last().cloned().unwrap();
+            for (name, ns) in &stages {
+                println!("{name:<28} {ns:>9.0} ns");
+            }
+            println!();
+            for (name, sign) in &stages[..stages.len() - 1] {
+                let attempt = sign + check;
+                println!("{:<28} {attempt:>9.0} ns  ~{:.0}/s per thread", format!("attempt, {}", name.trim_start_matches("sign: ")), 1e9 / attempt);
             }
         }
         Command::Verify { file } => {

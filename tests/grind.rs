@@ -6,6 +6,7 @@ use plc_mint::{
     example,
     grind::{Grinder, Hit, Job, Limits, Mode, Rule},
     op,
+    signer::NonceMode,
 };
 use rand_core::OsRng;
 use serde_json::Value;
@@ -18,15 +19,15 @@ fn job(mode: Mode, value: &str) -> (Job, k256::ecdsa::SigningKey) {
     (job, key)
 }
 
-fn grind_on(threads: usize, mode: Mode, value: &str) -> (Hit, k256::ecdsa::SigningKey) {
+fn grind_with(threads: usize, nonce: NonceMode, mode: Mode, value: &str) -> (Hit, k256::ecdsa::SigningKey) {
     let (job, key) = job(mode, value);
     let limits = Limits { max_attempts: Some(5_000_000), ..Default::default() };
-    let outcome = Grinder::new(job).unwrap().run(threads, limits, Duration::MAX, |_, _| {}).unwrap();
+    let outcome = Grinder::new(job).unwrap().run(threads, nonce, limits, Duration::MAX, |_, _| {}).unwrap();
     (outcome.hit.expect("no hit"), key)
 }
 
 fn grind(mode: Mode, value: &str) -> (Hit, k256::ecdsa::SigningKey) {
-    grind_on(1, mode, value)
+    grind_with(1, NonceMode::Rfc6979, mode, value)
 }
 
 /// Verifies with libsecp256k1, which shares no code with the RustCrypto signer and
@@ -63,18 +64,20 @@ fn grinds_contains_and_suffix() {
 }
 
 #[test]
-fn grinds_on_many_threads() {
-    let (hit, key) = grind_on(4, Mode::Prefix, "abc");
-    assert!(hit.did.starts_with("did:plc:abc"), "{}", hit.did);
-    assert!(hit.attempts > 0);
-    verify_with_libsecp256k1(&hit.signed_op, &key);
+fn grinds_on_many_threads_with_every_nonce_mode() {
+    for nonce in NonceMode::ALL {
+        let (hit, key) = grind_with(4, nonce, Mode::Prefix, "abc");
+        assert!(hit.did.starts_with("did:plc:abc"), "{nonce}: {}", hit.did);
+        assert_eq!(op::did_for(&hit.signed_op).unwrap(), hit.did);
+        verify_with_libsecp256k1(&hit.signed_op, &key);
+    }
 }
 
 #[test]
 fn stops_at_the_deadline() {
     let (job, _) = job(Mode::Prefix, &"a".repeat(24));
     let limits = Limits { deadline: Some(std::time::Instant::now() + Duration::from_millis(200)), ..Default::default() };
-    let outcome = Grinder::new(job).unwrap().run(2, limits, Duration::MAX, |_, _| {}).unwrap();
+    let outcome = Grinder::new(job).unwrap().run(2, NonceMode::Incremental, limits, Duration::MAX, |_, _| {}).unwrap();
     assert!(outcome.hit.is_none());
     assert!(outcome.attempts > 0);
     assert!(outcome.elapsed < Duration::from_secs(2));
