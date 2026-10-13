@@ -41,6 +41,14 @@ Patterns use `a-z` and `2-7` only (no `0`, `1`, `8`, `9`). `prefix` and `suffix`
 
 `contains` divides these by roughly `25 - length` (about 19x for 6 characters). Measure your own machine with `plc-mint bench --nonce incremental --seconds 20` (or `--gpu`).
 
+### 2–3 in one go
+
+```sh
+plc-mint mint --mode prefix --value miguel --out ./miguel --gpu   # or --nonce incremental on a CPU
+```
+
+`mint` is `init` followed by `grind`: it writes `keys.json` and `job.json` first, then `hit.json` once it finds a match, and prints the DID. It takes the options of both. If you stop it midway, `plc-mint grind --job miguel/job.json` picks up the same job (a fresh search; the odds don't depend on how long it already ran). The two steps separately:
+
 ### 2. Create keys and a job
 
 ```sh
@@ -94,6 +102,7 @@ Tested against a stock self-hosted PDS (`bluesky-social/pds` 0.4). Bluesky's own
 ```sh
 plc-mint init --mode prefix --value mig --out DIR  # keys.json + job.json
 plc-mint grind --job job.json --nonce incremental  # stdout: the hit as JSON
+plc-mint mint --value mig --out DIR --gpu          # init + grind: keys.json, job.json, hit.json
 plc-mint bench --seconds 300 --threads 10          # sustained attempts/s, every nonce mode
 plc-mint profile                                   # ns per signature per nonce mode, and per hash check
 plc-mint verify signed-op.json                     # recompute DID + check signature
@@ -105,6 +114,7 @@ plc-mint example-job --mode prefix --value mig     # throwaway job for testing; 
 | --- | --- |
 | `init --mode --value --out DIR [--recovery did:key]` | Writes `DIR/keys.json` and `DIR/job.json` (mode 0600, never overwritten). The value is lowercased and validated. |
 | `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--nonce MODE` (default `rfc6979`), `--gpu`, `--max-attempts N` gives up with exit code 2. Progress goes to stderr. |
+| `mint` | `init`, then `grind` on the new job; writes `DIR/hit.json` and prints the DID. Takes the options of both. |
 | `bench` | Grinds a never-matching job for `--seconds` at every combination of `--nonce a,b` (default: all) and `--threads 1,6,12`, one JSON line per run: `{nonce, threads, seconds, attempts, rate, ratePerThread}`. |
 | `profile` | Single-threaded ns per signature for each nonce mode, ns per hash check, and the resulting attempts/s per thread. |
 | `verify <file\|->` | Takes a signed op, or `{did, operation}` as in a `plc.directory/:did/log/audit` entry. Prints the DID, the signing rotation key and, if given, whether it matches the expected DID. |

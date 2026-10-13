@@ -1,5 +1,6 @@
 use std::{
     io::Read,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -8,7 +9,7 @@ use clap::{Parser, Subcommand};
 use data_encoding::HEXLOWER;
 use plc_mint::{
     didkey, example,
-    grind::{Grinder, Job, Limits, Mode, Rule},
+    grind::{Grinder, Hit, Job, Limits, Mode, Rule},
     init, op,
     signer::NonceMode,
 };
@@ -26,37 +27,23 @@ struct Cli {
 enum Command {
     /// Create keys and a job to grind. Writes <out>/job.json and <out>/keys.json.
     Init {
-        #[arg(long, value_enum, default_value = "prefix")]
-        mode: ModeArg,
-        /// The string to look for (a-z, 2-7).
-        #[arg(long)]
-        value: String,
-        /// Bring your own recovery key (did:key, k256 or P-256) instead of generating one.
-        #[arg(long)]
-        recovery: Option<String>,
-        /// Directory to write into; created if missing. Existing files are never overwritten.
-        #[arg(long)]
-        out: std::path::PathBuf,
+        #[command(flatten)]
+        init: InitArgs,
     },
     /// Grind a job until its DID matches. Prints the hit as JSON.
     Grind {
         /// Job file, or - for stdin.
         #[arg(long)]
         job: String,
-        /// Worker threads. Defaults to every logical CPU.
-        #[arg(long)]
-        threads: Option<usize>,
-        /// Nonce strategy: rfc6979, random or incremental.
-        #[arg(long, default_value = "rfc6979")]
-        nonce: NonceMode,
-        /// Seconds between progress lines on stderr.
-        #[arg(long, default_value_t = 5)]
-        report_every: u64,
-        /// Give up after this many attempts (exit code 2).
-        #[arg(long)]
-        max_attempts: Option<u64>,
         #[command(flatten)]
-        gpu: GpuArgs,
+        grind: GrindArgs,
+    },
+    /// init + grind in one go. Writes <out>/keys.json, job.json and hit.json, ready for plc-claim.
+    Mint {
+        #[command(flatten)]
+        init: InitArgs,
+        #[command(flatten)]
+        grind: GrindArgs,
     },
     /// Measure sustained attempts per second against a job that never matches.
     Bench {
@@ -103,6 +90,39 @@ enum Command {
         #[arg(long, default_value = "abc")]
         value: String,
     },
+}
+
+#[derive(clap::Args)]
+struct InitArgs {
+    #[arg(long, value_enum, default_value = "prefix")]
+    mode: ModeArg,
+    /// The string to look for (a-z, 2-7).
+    #[arg(long)]
+    value: String,
+    /// Bring your own recovery key (did:key, k256 or P-256) instead of generating one.
+    #[arg(long)]
+    recovery: Option<String>,
+    /// Directory to write into; created if missing. Existing files are never overwritten.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct GrindArgs {
+    /// Worker threads. Defaults to every logical CPU.
+    #[arg(long)]
+    threads: Option<usize>,
+    /// Nonce strategy: rfc6979, random or incremental.
+    #[arg(long, default_value = "rfc6979")]
+    nonce: NonceMode,
+    /// Seconds between progress lines on stderr.
+    #[arg(long, default_value_t = 5)]
+    report_every: u64,
+    /// Give up after this many attempts (exit code 2).
+    #[arg(long)]
+    max_attempts: Option<u64>,
+    #[command(flatten)]
+    gpu: GpuArgs,
 }
 
 #[derive(clap::Args)]
@@ -164,37 +184,23 @@ impl From<ModeArg> for Mode {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Init { mode, value, recovery, out } => {
-            let rule = Rule { mode: mode.into(), value: value.to_lowercase() };
-            let init = init::init(&rule, recovery.as_deref())?;
-            std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
-            write_private(&out.join("keys.json"), &init.keys)?;
-            write_private(&out.join("job.json"), &init.job)?;
-            eprintln!("wrote {0}/job.json and {0}/keys.json", out.display());
-            eprintln!("keys.json holds private keys: keep it, back it up, never share it");
+        Command::Init { init } => {
+            write_init(&init)?;
         }
-        Command::Grind { job, threads, nonce, report_every, max_attempts, gpu: gpu_args } => {
+        Command::Grind { job, grind: args } => {
             let job: Job = serde_json::from_str(&read_input(&job)?).context("invalid job JSON")?;
-            let threads = threads.unwrap_or_else(logical_cpus);
-            let limits = Limits { max_attempts, ..Default::default() };
-            let grinder = Grinder::new(job)?;
-            let every = Duration::from_secs(report_every);
-            let outcome = if gpu_args.gpu {
-                gpu(&gpu_args)?.run(&grinder, limits, every, progress)?
-            } else {
-                grinder.run(threads, nonce, limits, every, progress)?
-            };
-            match outcome.hit {
-                Some(hit) => {
-                    println!("{}", serde_json::to_string_pretty(&hit)?);
-                    // stdout usually goes to a file; show the result on the terminal too.
-                    eprintln!("{}", hit.did);
-                }
-                None => {
-                    eprintln!("no match within --max-attempts");
-                    std::process::exit(2);
-                }
-            }
+            let hit = grind(job, &args)?;
+            println!("{}", serde_json::to_string_pretty(&hit)?);
+            // stdout usually goes to a file; show the result on the terminal too.
+            eprintln!("{}", hit.did);
+        }
+        Command::Mint { init, grind: args } => {
+            let job = write_init(&init)?;
+            let hit = grind(serde_json::from_value(job)?, &args)?;
+            let path = init.out.join("hit.json");
+            write_private(&path, &serde_json::to_value(&hit)?)?;
+            eprintln!("wrote {}", path.display());
+            println!("{}", hit.did);
         }
         Command::Bench { seconds, threads, nonce, report_every, gpu: gpu_args } => {
             let threads = if threads.is_empty() { vec![logical_cpus()] } else { threads };
@@ -295,6 +301,39 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Writes keys.json and job.json for `init` and returns the job.
+fn write_init(args: &InitArgs) -> Result<Value> {
+    let rule = Rule { mode: args.mode.clone().into(), value: args.value.to_lowercase() };
+    let init = init::init(&rule, args.recovery.as_deref())?;
+    let out = &args.out;
+    std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    // Refuse up front rather than after a long grind.
+    let hit = out.join("hit.json");
+    anyhow::ensure!(!hit.exists(), "{} already exists", hit.display());
+    write_private(&out.join("keys.json"), &init.keys)?;
+    write_private(&out.join("job.json"), &init.job)?;
+    eprintln!("wrote {0}/job.json and {0}/keys.json", out.display());
+    eprintln!("keys.json holds private keys: keep it, back it up, never share it");
+    Ok(init.job)
+}
+
+/// Grinds until a hit; exits with code 2 if `--max-attempts` runs out first.
+fn grind(job: Job, args: &GrindArgs) -> Result<Hit> {
+    let threads = args.threads.unwrap_or_else(logical_cpus);
+    let limits = Limits { max_attempts: args.max_attempts, ..Default::default() };
+    let grinder = Grinder::new(job)?;
+    let every = Duration::from_secs(args.report_every);
+    let outcome = if args.gpu.gpu {
+        gpu(&args.gpu)?.run(&grinder, limits, every, progress)?
+    } else {
+        grinder.run(threads, args.nonce, limits, every, progress)?
+    };
+    outcome.hit.ok_or_else(|| {
+        eprintln!("no match within --max-attempts");
+        std::process::exit(2)
+    })
 }
 
 fn progress(attempts: u64, elapsed: Duration) {
