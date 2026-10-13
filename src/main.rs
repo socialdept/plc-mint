@@ -9,7 +9,7 @@ use data_encoding::HEXLOWER;
 use plc_mint::{
     didkey, example,
     grind::{Grinder, Job, Limits, Mode, Rule},
-    op,
+    init, op,
     signer::NonceMode,
 };
 use rand_core::OsRng;
@@ -24,6 +24,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create keys and a job to grind. Writes <out>/job.json and <out>/keys.json.
+    Init {
+        #[arg(long, value_enum, default_value = "prefix")]
+        mode: ModeArg,
+        /// The string to look for (a-z, 2-7).
+        #[arg(long)]
+        value: String,
+        /// Bring your own recovery key (did:key, k256 or P-256) instead of generating one.
+        #[arg(long)]
+        recovery: Option<String>,
+        /// Directory to write into; created if missing. Existing files are never overwritten.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
     /// Grind a job until its DID matches. Prints the hit as JSON.
     Grind {
         /// Job file, or - for stdin.
@@ -138,8 +152,27 @@ enum ModeArg {
     Suffix,
 }
 
+impl From<ModeArg> for Mode {
+    fn from(mode: ModeArg) -> Self {
+        match mode {
+            ModeArg::Prefix => Mode::Prefix,
+            ModeArg::Contains => Mode::Contains,
+            ModeArg::Suffix => Mode::Suffix,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Init { mode, value, recovery, out } => {
+            let rule = Rule { mode: mode.into(), value: value.to_lowercase() };
+            let init = init::init(&rule, recovery.as_deref())?;
+            std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+            write_private(&out.join("keys.json"), &init.keys)?;
+            write_private(&out.join("job.json"), &init.job)?;
+            eprintln!("wrote {0}/job.json and {0}/keys.json", out.display());
+            eprintln!("keys.json holds private keys: keep it, back it up, never share it");
+        }
         Command::Grind { job, threads, nonce, report_every, max_attempts, gpu: gpu_args } => {
             let job: Job = serde_json::from_str(&read_input(&job)?).context("invalid job JSON")?;
             let threads = threads.unwrap_or_else(logical_cpus);
@@ -254,12 +287,7 @@ fn main() -> Result<()> {
             );
         }
         Command::ExampleJob { mode, value } => {
-            let mode = match mode {
-                ModeArg::Prefix => Mode::Prefix,
-                ModeArg::Contains => Mode::Contains,
-                ModeArg::Suffix => Mode::Suffix,
-            };
-            println!("{}", serde_json::to_string_pretty(&example::job(&Rule { mode, value }))?);
+            println!("{}", serde_json::to_string_pretty(&example::job(&Rule { mode: mode.into(), value }))?);
         }
     }
     Ok(())
@@ -271,6 +299,18 @@ fn progress(attempts: u64, elapsed: Duration) {
         elapsed.as_secs_f64(),
         attempts as f64 / elapsed.as_secs_f64()
     );
+}
+
+/// Writes JSON readable only by the owner, refusing to replace an existing file.
+fn write_private(path: &std::path::Path, value: &Value) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).with_context(|| format!("creating {} (it must not exist yet)", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string_pretty(value)?)?;
+    Ok(())
 }
 
 fn logical_cpus() -> usize {

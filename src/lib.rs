@@ -3,5 +3,6 @@ pub mod didkey;
 pub mod example;
 pub mod gpu;
 pub mod grind;
+pub mod init;
 pub mod op;
 pub mod signer;
