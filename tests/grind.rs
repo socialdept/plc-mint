@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use plc_mint::{
     example,
-    grind::{Grinder, Hit, Job, Limits, Mode, Rule},
+    grind::{Grinder, Hit, Job, Limits, Mode, Position, Rule},
     op,
     signer::NonceMode,
 };
@@ -22,7 +22,7 @@ fn job(mode: Mode, value: &str) -> (Job, k256::ecdsa::SigningKey) {
 fn grind_with(threads: usize, nonce: NonceMode, mode: Mode, value: &str) -> (Hit, k256::ecdsa::SigningKey) {
     let (job, key) = job(mode, value);
     let limits = Limits { max_attempts: Some(5_000_000), ..Default::default() };
-    let outcome = Grinder::new(job).unwrap().run(threads, nonce, limits, Duration::MAX, |_, _| {}).unwrap();
+    let outcome = Grinder::new(job).unwrap().run(threads, nonce, limits, Duration::MAX, |_, _| {}, |_| Ok(())).unwrap();
     (outcome.hit.expect("no hit"), key)
 }
 
@@ -74,10 +74,59 @@ fn grinds_on_many_threads_with_every_nonce_mode() {
 }
 
 #[test]
+fn reports_alternatives_until_the_target() {
+    // "ab" as a prefix: about 1 in 1024 attempts; "ab" elsewhere about 22 times as often.
+    let (job, key) = job(Mode::Prefix, "ab");
+    let grinder = Grinder::new(job).unwrap().with_alternatives(3);
+    let mut alternatives = Vec::new();
+    let outcome = grinder
+        .run(2, NonceMode::Incremental, Limits::default(), Duration::MAX, |_, _| {}, |hit| {
+            alternatives.push(hit);
+            Ok(())
+        })
+        .unwrap();
+    let hit = outcome.hit.unwrap();
+    assert!(hit.did.starts_with("did:plc:ab") && hit.position.is_none());
+
+    for position in Position::ALL {
+        assert!(alternatives.iter().filter(|a| a.position == Some(position)).count() <= 3, "{position:?} over the cap");
+    }
+    for alt in &alternatives {
+        let id = alt.did.trim_start_matches("did:plc:");
+        let expected = if id.starts_with("ab") {
+            unreachable!("a prefix match is the target, not an alternative: {id}")
+        } else if id.ends_with("ab") {
+            Position::End
+        } else {
+            assert!(id.contains("ab"), "{id}");
+            Position::Middle
+        };
+        assert_eq!(alt.position, Some(expected), "{id}");
+        assert_eq!(op::did_for(&alt.signed_op).unwrap(), alt.did);
+        verify_with_libsecp256k1(&alt.signed_op, &key);
+    }
+}
+
+#[test]
+fn contains_has_no_alternatives() {
+    let (job, _) = job(Mode::Contains, "ab");
+    let mut count = 0;
+    Grinder::new(job)
+        .unwrap()
+        .with_alternatives(3)
+        .run(2, NonceMode::Incremental, Limits::default(), Duration::MAX, |_, _| {}, |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
 fn stops_at_the_deadline() {
     let (job, _) = job(Mode::Prefix, &"a".repeat(24));
     let limits = Limits { deadline: Some(std::time::Instant::now() + Duration::from_millis(200)), ..Default::default() };
-    let outcome = Grinder::new(job).unwrap().run(2, NonceMode::Incremental, limits, Duration::MAX, |_, _| {}).unwrap();
+    let outcome = Grinder::new(job).unwrap().run(2, NonceMode::Incremental, limits, Duration::MAX, |_, _| {}, |_| Ok(())).unwrap();
     assert!(outcome.hit.is_none());
     assert!(outcome.attempts > 0);
     assert!(outcome.elapsed < Duration::from_secs(2));

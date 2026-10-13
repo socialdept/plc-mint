@@ -6,6 +6,8 @@
 //
 // Every step checks what is already done, so re-running after a failure resumes.
 
+import { existsSync, readdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { randomBytes, bytesToHex } from '@noble/hashes/utils'
 import { HttpError, cidOf, didOf, hex, opSignedBy, pdsClient, plcClient, secp256k1, serviceAuth, signOp, type Op } from './lib'
@@ -83,6 +85,28 @@ if (!keys.grind.privateKey || !keys.tempSigning.privateKey) fail('--keys is miss
 const grindKey = hex(keys.grind.privateKey)
 const tempKey = hex(keys.tempSigning.privateKey)
 
+// Every DID from one job (the hit and its alternatives) carries a signature from the
+// same grind key with related nonces. Two of them in public would reveal the key, so
+// only one may ever be published.
+const jobDir = dirname(args.keys!)
+const siblingFiles = [
+  join(jobDir, 'hit.json'),
+  ...(existsSync(join(jobDir, 'alternatives')) ? readdirSync(join(jobDir, 'alternatives')).map((f) => join(jobDir, 'alternatives', f)) : []),
+].filter((f) => f.endsWith('.json') && existsSync(f))
+const siblings: string[] = []
+for (const file of siblingFiles) {
+  const other = (await Bun.file(file).json()).did as string
+  if (other && other !== did && !siblings.includes(other)) siblings.push(other)
+}
+for (const other of siblings) {
+  if ((await plc.audit(other)) !== null) {
+    fail(
+      `${other}, from the same job, is already published. Publishing a second DID from one job ` +
+        `would reveal the grind key. Grind a new job (plc-mint init) instead.`,
+    )
+  }
+}
+
 const server = await xrpc('com.atproto.server.describeServer').catch((e) => fail(`${PDS} is not reachable as a PDS: ${e.message}`))
 const audit = await plc.audit(did)
 const published = audit !== null
@@ -117,6 +141,7 @@ say(`  handle     ${handle}`)
 say(`  genesis    ${published ? 'already published' : 'not published yet'}`)
 say(`  account    ${accountExists ? 'already exists' : 'will be created'}`)
 say(`  grind key  ${args['keep-grind-key'] ? 'kept' : 'dropped'} once the PDS keys are installed`)
+if (siblings.length) say(`  others     ${siblings.length} other DID(s) from this job become unusable once this one is published`)
 
 if (args['dry-run']) {
   say('dry run: checks passed, nothing changed')
@@ -202,6 +227,7 @@ try {
   const final = await plc.data(did)
   say(`done: ${did} is live on ${PDS} as @${handle}`)
   say('keep keys.json: its recovery key can move or rescue the account even without this PDS')
+  if (siblings.length) say(`the ${siblings.length} other DID(s) from this job can never be published now; delete them`)
   console.log(
     JSON.stringify(
       { did, handle, pds: PDS, rotationKeys: final.rotationKeys, ...(generatedPassword ? { password: generatedPassword } : {}) },

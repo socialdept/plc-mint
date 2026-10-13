@@ -47,7 +47,19 @@ Patterns use `a-z` and `2-7` only (no `0`, `1`, `8`, `9`). `prefix` and `suffix`
 plc-mint mint --mode prefix --value miguel --out ./miguel --gpu   # or --nonce incremental on a CPU
 ```
 
-`mint` is `init` followed by `grind`: it writes `keys.json` and `job.json` first, then `hit.json` once it finds a match, and prints the DID. It takes the options of both. If you stop it midway, `plc-mint grind --job miguel/job.json` picks up the same job (a fresh search; the odds don't depend on how long it already ran). The two steps separately:
+`mint` is `init` followed by `grind`: it writes `keys.json` and `job.json` first, then `hit.json` once it finds a match, and prints the DID. It takes the options of both. If you stop it midway, `plc-mint grind --job miguel/job.json` picks up the same job (a fresh search; the odds don't depend on how long it already ran).
+
+**Alternatives while you wait.** For a prefix or suffix, `mint` also saves DIDs where the value lands somewhere else, as they turn up:
+
+```
+alternative (middle): did:plc:eua3ole6imiguelups5abcd2i  -> miguel/alternatives/eua3ole6imiguelups5abcd2i.json
+```
+
+Positions are `start`, `end` and `middle`; the value is 15 to 20 times more likely to turn up in the middle than at a given end, so the first few arrive long before the target. Up to `--alternatives N` are kept per position (default 10, `0` turns it off). If the wait gets too long, stop the grind (Ctrl-C) and claim an alternative instead: `plc-claim --hit miguel/alternatives/<id>.json …`.
+
+**Claim only one DID per job.** The hit and all its alternatives share the job's keys and are signed by the same grind key with related nonces; two of them in public would reveal that key. `plc-claim` refuses to publish one when another from the same job (`hit.json` or `alternatives/` next to `keys.json`) is already on PLC. To get a second DID, run `mint` again.
+
+The two steps separately:
 
 ### 2. Create keys and a job
 
@@ -113,8 +125,8 @@ plc-mint example-job --mode prefix --value mig     # throwaway job for testing; 
 | Command | Purpose |
 | --- | --- |
 | `init --mode --value --out DIR [--recovery did:key]` | Writes `DIR/keys.json` and `DIR/job.json` (mode 0600, never overwritten). The value is lowercased and validated. |
-| `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--nonce MODE` (default `rfc6979`), `--gpu`, `--max-attempts N` gives up with exit code 2. Progress goes to stderr. |
-| `mint` | `init`, then `grind` on the new job; writes `DIR/hit.json` and prints the DID. Takes the options of both. |
+| `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--nonce MODE` (default `rfc6979`), `--gpu`, `--max-attempts N` gives up with exit code 2, `--save-alternatives DIR` saves alternatives (up to `--alternatives N` per position). Progress goes to stderr. |
+| `mint` | `init`, then `grind` on the new job; writes `DIR/hit.json` and prints the DID, saving alternatives to `DIR/alternatives/` as they turn up. Takes the options of both. |
 | `bench` | Grinds a never-matching job for `--seconds` at every combination of `--nonce a,b` (default: all) and `--threads 1,6,12`, one JSON line per run: `{nonce, threads, seconds, attempts, rate, ratePerThread}`. |
 | `profile` | Single-threaded ns per signature for each nonce mode, ns per hash check, and the resulting attempts/s per thread. |
 | `verify <file\|->` | Takes a signed op, or `{did, operation}` as in a `plc.directory/:did/log/audit` entry. Prints the DID, the signing rotation key and, if given, whether it matches the expected DID. |
@@ -156,7 +168,7 @@ Every mode signs the same digest with the same key and yields valid, low-S signa
 
 ### GPU (spike, macOS / Metal)
 
-`gpu/kernel.metal` runs the `incremental` algorithm on the GPU: each GPU thread owns a nonce range (`k0 + t * 2^64`), walks `R_i = R_{i-1} + G`, batch-inverts point Z coordinates and nonces once per `--gpu-batch` attempts, then signs, hashes and matches on the GPU. Only the hit comes back, and it goes through the same CPU rebuild-and-verify as every other hit.
+`gpu/kernel.metal` runs the `incremental` algorithm on the GPU: each GPU thread owns a nonce range (`k0 + t * 2^64`), walks `R_i = R_{i-1} + G`, batch-inverts point Z coordinates and nonces once per `--gpu-batch` attempts, then signs, hashes and matches on the GPU. Only the hit (and up to 16 alternatives per dispatch) comes back, and each goes through the same CPU rebuild-and-verify as every other hit. `gpu-selftest` checks every attempt's verdict (target, start, end, middle or miss) against the CPU.
 
 ```sh
 cargo build --release --features gpu        # macOS only

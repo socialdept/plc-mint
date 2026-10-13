@@ -17,14 +17,17 @@ use k256::{
 };
 use rand_core::OsRng;
 
-use crate::grind::{Grinder, Mode};
+use crate::grind::{Grinder, Mode, Position, Verdict};
 
 /// Words per thread in the state buffer: nonce k, then affine x and y of k*G.
 pub const STATE_WORDS: usize = 24;
-/// Words per attempt in the debug buffer: r, s, matched flag.
+/// Words per attempt in the debug buffer: r, s, verdict code.
 pub const DEBUG_WORDS: usize = 17;
-/// Words in the hit buffer: count, thread id, r, s.
-pub const HIT_WORDS: usize = 18;
+/// Alternative records the kernel keeps per dispatch (`ALT_SLOTS` in the kernel).
+pub const ALT_SLOTS: usize = 16;
+/// Words in the hit buffer: target count, thread id, r, s; then alternative count
+/// and `ALT_SLOTS` records of verdict code, r, s.
+pub const HIT_WORDS: usize = 19 + ALT_SLOTS * 17;
 
 /// Mirrors `struct Params` in `gpu/kernel.metal`.
 #[repr(C)]
@@ -38,6 +41,7 @@ pub struct Params {
     pub len: u32,
     pub chunks: u32,
     pub debug: u32,
+    pub alt: u32,
     pub value: [u32; 24],
     pub sched: [u32; 384],
 }
@@ -79,6 +83,7 @@ pub fn params(grinder: &Grinder, chunks: u32, debug: bool) -> Result<Params> {
         len: rule.value.len() as u32,
         chunks,
         debug: debug as u32,
+        alt: (grinder.alternatives > 0) as u32,
         value,
         sched: constant_schedules(&msg),
     })
@@ -146,6 +151,19 @@ pub fn sig_bytes(words: &[u32]) -> [u8; 64] {
 pub struct DebugReport {
     pub signatures: usize,
     pub matches: usize,
+    pub alternatives: usize,
+}
+
+/// The alternatives a dispatch recorded: (signature, position), at most `ALT_SLOTS`.
+pub fn alternatives(hit: &[u32]) -> Vec<([u8; 64], Position)> {
+    let count = (hit[18] as usize).min(ALT_SLOTS);
+    hit[19..19 + count * 17]
+        .chunks_exact(17)
+        .filter_map(|record| match Verdict::from_code(record[0]) {
+            Verdict::Alternative(position) => Some((sig_bytes(&record[1..17]), position)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Checks every attempt the kernel recorded: the signature verifies (low-S) under
@@ -162,10 +180,11 @@ pub fn verify_debug(grinder: &Grinder, dbg: &[u32], seen_r: &mut HashSet<[u8; 32
             .map_err(|_| anyhow::anyhow!("attempt {i}: signature does not verify"))?;
         ensure!(seen_r.insert(sig[..32].try_into().unwrap()), "attempt {i}: repeated r (nonce reuse)");
 
-        let gpu_matched = record[16] != 0;
-        ensure!(gpu_matched == cpu.check(&sig), "attempt {i}: kernel match verdict disagrees with the CPU");
+        let verdict = Verdict::from_code(record[16]);
+        ensure!(verdict == cpu.verdict(&sig), "attempt {i}: kernel verdict {verdict:?} disagrees with the CPU");
         report.signatures += 1;
-        report.matches += gpu_matched as usize;
+        report.matches += (verdict == Verdict::Target) as usize;
+        report.alternatives += matches!(verdict, Verdict::Alternative(_)) as usize;
     }
     Ok(report)
 }
@@ -218,7 +237,7 @@ pub mod metal_backend {
     use metal::{CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 
     use super::{DEBUG_WORDS, DebugReport, HIT_WORDS, Params};
-    use crate::grind::{Grinder, Hit, Limits, Outcome};
+    use crate::grind::{Grinder, Hit, Limits, Outcome, Verdict};
 
     const KERNEL: &str = include_str!("../gpu/kernel.metal");
     /// Wall time to aim for per dispatch: long enough to amortize overhead, short
@@ -294,11 +313,24 @@ pub mod metal_backend {
                 let report = super::verify_debug(grinder, Self::words(&dbg, records * DEBUG_WORDS), &mut seen)?;
                 total.signatures += report.signatures;
                 total.matches += report.matches;
+                total.alternatives += report.alternatives;
             }
             let hits = Self::words(&hit, HIT_WORDS);
             if total.matches > 0 {
                 anyhow::ensure!(hits[0] as usize == total.matches, "hit counter {} != matches {}", hits[0], total.matches);
-                grinder.finish(&super::sig_bytes(&hits[2..18])).context("recorded hit failed CPU verification")?;
+                grinder.finish(&super::sig_bytes(&hits[2..18]), Verdict::Target).context("recorded hit failed CPU verification")?;
+            }
+            anyhow::ensure!(
+                hits[18] as usize == total.alternatives,
+                "alternative counter {} != alternatives {}",
+                hits[18],
+                total.alternatives
+            );
+            for (sig, position) in super::alternatives(hits) {
+                anyhow::ensure!(
+                    grinder.clone().verdict(&sig) == Verdict::Alternative(position),
+                    "recorded alternative disagrees with the CPU"
+                );
             }
             Ok(total)
         }
@@ -309,6 +341,7 @@ pub mod metal_backend {
             limits: Limits,
             every: Duration,
             mut report: impl FnMut(u64, Duration),
+            mut alternative: impl FnMut(Hit) -> Result<()>,
         ) -> Result<Outcome> {
             let state = self.buffer(&super::initial_state(self.threads));
             let hit = self.buffer(&[0u32; HIT_WORDS]);
@@ -319,6 +352,7 @@ pub mod metal_backend {
             let mut last_report = start;
             let mut attempts = 0u64;
             let mut chunks = 1u32;
+            let mut kept = [0usize; 3];
             loop {
                 let params = super::params(grinder, chunks, false)?;
                 let t = Instant::now();
@@ -327,18 +361,19 @@ pub mod metal_backend {
                 attempts += per_chunk * chunks as u64;
 
                 let hits = Self::words(&hit, HIT_WORDS);
+                for (sig, position) in super::alternatives(hits) {
+                    if kept[position as usize] < grinder.alternatives {
+                        kept[position as usize] += 1;
+                        alternative(grinder.hit(&sig, attempts, start.elapsed(), Some(position))?)?;
+                    }
+                }
                 if hits[0] != 0 {
                     let elapsed = start.elapsed();
-                    let (did, signed_op) = grinder.finish(&super::sig_bytes(&hits[2..18]))?;
-                    let hit = Hit {
-                        did,
-                        signed_op,
-                        attempts,
-                        elapsed_ms: elapsed.as_millis(),
-                        rate: attempts as f64 / elapsed.as_secs_f64(),
-                    };
+                    let hit = grinder.hit(&super::sig_bytes(&hits[2..18]), attempts, elapsed, None)?;
                     return Ok(Outcome { hit: Some(hit), attempts, elapsed });
                 }
+                // Start the next dispatch with no alternatives recorded.
+                unsafe { *(hit.contents() as *mut u32).add(18) = 0 };
                 if limits.max_attempts.is_some_and(|max| attempts >= max)
                     || limits.deadline.is_some_and(|deadline| Instant::now() >= deadline)
                 {

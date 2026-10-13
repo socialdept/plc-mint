@@ -4,7 +4,7 @@
 //
 //   bun run e2e.ts [prefix]     (default prefix: "e2e")
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { bytesToHex, randomBytes } from '@noble/hashes/utils'
@@ -27,9 +27,14 @@ function check(cond: unknown, msg: string): asserts cond {
   ok(msg)
 }
 
-async function run(cmd: string[], env: Record<string, string> = {}) {
+async function exec(cmd: string[], env: Record<string, string> = {}) {
   const proc = Bun.spawn(cmd, { env: { ...process.env, ...env }, stdout: 'pipe', stderr: 'pipe' })
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+  return { stdout, stderr, code }
+}
+
+async function run(cmd: string[], env: Record<string, string> = {}) {
+  const { stdout, stderr, code } = await exec(cmd, env)
   if (code !== 0) throw new Error(`${cmd.join(' ')} exited ${code}\n${stderr}`)
   return stdout
 }
@@ -48,13 +53,25 @@ try {
   check(keys.recovery.privateKey === undefined, 'keys.json holds no private half for a brought recovery key')
   const grind = hex(keys.grind.privateKey)
 
-  log(`plc-mint grind for prefix "${PREFIX}" (incremental nonces)`)
-  const hit = JSON.parse(await run([BIN, 'grind', '--job', join(dir, 'job.json'), '--threads', '2', '--nonce', 'incremental']))
+  log(`plc-mint grind for prefix "${PREFIX}" (incremental nonces), saving alternatives`)
+  const alternativesDir = join(dir, 'alternatives')
+  const hit = JSON.parse(
+    await run([BIN, 'grind', '--job', join(dir, 'job.json'), '--threads', '2', '--nonce', 'incremental', '--save-alternatives', alternativesDir]),
+  )
   await Bun.write(join(dir, 'hit.json'), JSON.stringify(hit))
   const did: string = hit.did
   check(did.startsWith(`did:plc:${PREFIX}`), `found ${did} in ${hit.attempts} attempts`)
   check(didOf(hit.signedOp) === did, '@ipld/dag-cbor + sha256 reproduce the DID')
   check(opSignedBy(hit.signedOp, keys.grind.didKey), '@noble/curves verifies the genesis signature (low-S)')
+  const alternatives = readdirSync(alternativesDir).map((f) => join(alternativesDir, f))
+  for (const file of alternatives) {
+    const alt = await Bun.file(file).json()
+    const id = alt.did.slice('did:plc:'.length)
+    if (didOf(alt.signedOp) !== alt.did || !opSignedBy(alt.signedOp, keys.grind.didKey) || id.startsWith(PREFIX) || !id.includes(PREFIX)) {
+      throw new Error(`FAILED: bad alternative ${file}`)
+    }
+  }
+  check(alternatives.length > 0, `${alternatives.length} alternatives saved, each valid with "${PREFIX}" elsewhere`)
 
   const claimArgs = ['bun', CLAIM, '--hit', join(dir, 'hit.json'), '--keys', join(dir, 'keys.json'), '--pds', PDS, '--plc', PLC, '--handle', handle, '--email', `${tag}@example.com`]
 
@@ -70,6 +87,12 @@ try {
   check(!doc.rotationKeys.includes(keys.grind.didKey), 'grind key dropped')
   check(doc.alsoKnownAs[0] === `at://${handle}`, `PLC shows at://${handle}`)
   check((await plc.audit(did))!.length === 2, 'two ops in the log: genesis, credentials')
+
+  log('plc-claim refuses an alternative from the same job (it would reveal the grind key)')
+  const refused = await exec([...claimArgs.map((a) => (a === join(dir, 'hit.json') ? alternatives[0] : a)), '--yes'], { PDS_PASSWORD: password })
+  check(refused.code !== 0 && /already published/.test(refused.stderr), 'refused')
+  const altDid = (await Bun.file(alternatives[0]).json()).did
+  check((await plc.audit(altDid)) === null, 'alternative never reached PLC')
 
   log('plc-claim again resumes as a no-op')
   await run([...claimArgs, '--yes'], { PDS_PASSWORD: password })

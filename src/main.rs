@@ -1,6 +1,6 @@
 use std::{
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -35,6 +35,9 @@ enum Command {
         /// Job file, or - for stdin.
         #[arg(long)]
         job: String,
+        /// Save alternatives (the value in other positions) into this directory.
+        #[arg(long)]
+        save_alternatives: Option<PathBuf>,
         #[command(flatten)]
         grind: GrindArgs,
     },
@@ -121,6 +124,10 @@ struct GrindArgs {
     /// Give up after this many attempts (exit code 2).
     #[arg(long)]
     max_attempts: Option<u64>,
+    /// Alternatives to save per position (start, end, middle) when the target is a
+    /// prefix or suffix. 0 turns them off.
+    #[arg(long, default_value_t = 10)]
+    alternatives: usize,
     #[command(flatten)]
     gpu: GpuArgs,
 }
@@ -151,7 +158,14 @@ struct NoGpu;
 
 #[cfg(not(all(feature = "gpu", target_os = "macos")))]
 impl NoGpu {
-    fn run(&self, _: &Grinder, _: Limits, _: Duration, _: impl FnMut(u64, Duration)) -> Result<plc_mint::grind::Outcome> {
+    fn run(
+        &self,
+        _: &Grinder,
+        _: Limits,
+        _: Duration,
+        _: impl FnMut(u64, Duration),
+        _: impl FnMut(Hit) -> Result<()>,
+    ) -> Result<plc_mint::grind::Outcome> {
         unreachable!()
     }
 
@@ -187,16 +201,16 @@ fn main() -> Result<()> {
         Command::Init { init } => {
             write_init(&init)?;
         }
-        Command::Grind { job, grind: args } => {
+        Command::Grind { job, save_alternatives, grind: args } => {
             let job: Job = serde_json::from_str(&read_input(&job)?).context("invalid job JSON")?;
-            let hit = grind(job, &args)?;
+            let hit = grind(job, &args, save_alternatives.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&hit)?);
             // stdout usually goes to a file; show the result on the terminal too.
             eprintln!("{}", hit.did);
         }
         Command::Mint { init, grind: args } => {
             let job = write_init(&init)?;
-            let hit = grind(serde_json::from_value(job)?, &args)?;
+            let hit = grind(serde_json::from_value(job)?, &args, Some(&init.out.join("alternatives")))?;
             let path = init.out.join("hit.json");
             write_private(&path, &serde_json::to_value(&hit)?)?;
             eprintln!("wrote {}", path.display());
@@ -213,7 +227,7 @@ fn main() -> Result<()> {
                 let gpu = gpu(&gpu_args)?;
                 eprintln!("bench: gpu for {seconds}s");
                 let limits = Limits { deadline: Some(Instant::now() + Duration::from_secs(seconds)), ..Default::default() };
-                let outcome = gpu.run(&grinder, limits, Duration::from_secs(report_every), progress)?;
+                let outcome = gpu.run(&grinder, limits, Duration::from_secs(report_every), progress, |_| Ok(()))?;
                 let rate = outcome.attempts as f64 / outcome.elapsed.as_secs_f64();
                 println!(
                     "{}",
@@ -232,7 +246,7 @@ fn main() -> Result<()> {
             for (mode, threads) in modes.iter().flat_map(|m| threads.iter().map(move |t| (*m, *t))) {
                 eprintln!("bench: {mode} nonces, {threads} threads for {seconds}s");
                 let limits = Limits { deadline: Some(Instant::now() + Duration::from_secs(seconds)), ..Default::default() };
-                let outcome = grinder.run(threads, mode, limits, Duration::from_secs(report_every), progress)?;
+                let outcome = grinder.run(threads, mode, limits, Duration::from_secs(report_every), progress, |_| Ok(()))?;
                 let rate = outcome.attempts as f64 / outcome.elapsed.as_secs_f64();
                 println!(
                     "{}",
@@ -248,14 +262,15 @@ fn main() -> Result<()> {
             }
         }
         Command::GpuSelftest { gpu: gpu_args, chunks } => {
-            // One character anywhere: about half of all attempts match, so both
-            // verdicts get exercised.
-            let rule = Rule { mode: Mode::Contains, value: "a".into() };
-            let grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?;
+            // One character as a prefix, with alternatives: about 1 in 32 attempts hits
+            // the target and most of the rest land elsewhere, so every verdict gets
+            // exercised.
+            let rule = Rule { mode: Mode::Prefix, value: "a".into() };
+            let grinder = Grinder::new(serde_json::from_value(example::job(&rule))?)?.with_alternatives(1);
             let report = gpu(&gpu_args)?.selftest(&grinder, chunks)?;
             println!(
-                "ok: {} signatures from the GPU all verify with unique nonces; {} match verdicts agree with the CPU",
-                report.signatures, report.matches
+                "ok: {} signatures from the GPU all verify with unique nonces; {} target and {} alternative verdicts agree with the CPU",
+                report.signatures, report.matches, report.alternatives
             );
         }
         Command::Profile { chunks } => {
@@ -319,16 +334,29 @@ fn write_init(args: &InitArgs) -> Result<Value> {
     Ok(init.job)
 }
 
-/// Grinds until a hit; exits with code 2 if `--max-attempts` runs out first.
-fn grind(job: Job, args: &GrindArgs) -> Result<Hit> {
+/// Grinds until a hit, saving alternatives into `alternatives` as they turn up;
+/// exits with code 2 if `--max-attempts` runs out first.
+fn grind(job: Job, args: &GrindArgs, alternatives: Option<&Path>) -> Result<Hit> {
     let threads = args.threads.unwrap_or_else(logical_cpus);
     let limits = Limits { max_attempts: args.max_attempts, ..Default::default() };
-    let grinder = Grinder::new(job)?;
+    let mut grinder = Grinder::new(job)?;
+    if let Some(dir) = alternatives {
+        grinder = grinder.with_alternatives(args.alternatives);
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     let every = Duration::from_secs(args.report_every);
+    let save = |hit: Hit| -> Result<()> {
+        let dir = alternatives.expect("alternatives are only reported when a directory is set");
+        let path = dir.join(format!("{}.json", hit.did.trim_start_matches("did:plc:")));
+        let position = serde_json::to_value(hit.position)?;
+        write_private(&path, &serde_json::to_value(&hit)?)?;
+        eprintln!("alternative ({}): {}  -> {}", position.as_str().unwrap_or_default(), hit.did, path.display());
+        Ok(())
+    };
     let outcome = if args.gpu.gpu {
-        gpu(&args.gpu)?.run(&grinder, limits, every, progress)?
+        gpu(&args.gpu)?.run(&grinder, limits, every, progress, save)?
     } else {
-        grinder.run(threads, args.nonce, limits, every, progress)?
+        grinder.run(threads, args.nonce, limits, every, progress, save)?
     };
     outcome.hit.ok_or_else(|| {
         eprintln!("no match within --max-attempts");

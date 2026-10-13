@@ -12,7 +12,7 @@ use k256::{
 use plc_mint::{
     example,
     gpu::{self, DEBUG_WORDS, HIT_WORDS, STATE_WORDS, reference},
-    grind::{Grinder, Mode, Rule},
+    grind::{Grinder, Mode, Rule, Verdict},
 };
 
 const THREADS: usize = 4;
@@ -33,7 +33,12 @@ fn nonce(state: &[u32], thread: usize) -> Scalar {
 
 /// Runs two dispatches and checks every attempt. Returns (signatures, matches).
 fn check(mode: Mode, value: &str) -> (usize, usize) {
-    let grinder = grinder(mode, value);
+    let (signatures, matches, _) = check_grinder(grinder(mode, value));
+    (signatures, matches)
+}
+
+/// As `check`, for any grinder. Returns (signatures, matches, alternatives).
+fn check_grinder(grinder: Grinder) -> (usize, usize, usize) {
     let params = gpu::params(&grinder, CHUNKS, true).unwrap();
     let batch = reference::batch();
     let per_dispatch = THREADS * CHUNKS as usize * batch;
@@ -41,7 +46,7 @@ fn check(mode: Mode, value: &str) -> (usize, usize) {
     let mut state = gpu::initial_state(THREADS);
     let mut hit = vec![0u32; HIT_WORDS];
     let mut seen = HashSet::new();
-    let (mut signatures, mut matches) = (0, 0);
+    let (mut signatures, mut matches, mut alternatives) = (0, 0, 0);
 
     for _ in 0..2 {
         let before = state.clone();
@@ -51,6 +56,7 @@ fn check(mode: Mode, value: &str) -> (usize, usize) {
         let report = gpu::verify_debug(&grinder, &dbg, &mut seen).unwrap();
         signatures += report.signatures;
         matches += report.matches;
+        alternatives += report.alternatives;
 
         // Attempt i of thread t must use nonce k_t + i, so r = x((k_t + i) * G) mod n.
         for t in 0..THREADS {
@@ -71,7 +77,13 @@ fn check(mode: Mode, value: &str) -> (usize, usize) {
         let sig = gpu::sig_bytes(&hit[2..18]);
         assert!(grinder.clone().check(&sig), "recorded hit does not match on the CPU");
     }
-    (signatures, matches)
+    assert_eq!(hit[18] as usize, alternatives, "alternative counter");
+    let recorded = gpu::alternatives(&hit);
+    assert_eq!(recorded.len(), alternatives.min(gpu::ALT_SLOTS));
+    for (sig, position) in recorded {
+        assert_eq!(grinder.clone().verdict(&sig), Verdict::Alternative(position), "recorded alternative");
+    }
+    (signatures, matches, alternatives)
 }
 
 #[test]
@@ -84,6 +96,17 @@ fn contains_mode_agrees_with_the_cpu() {
 fn prefix_and_suffix_modes_agree_with_the_cpu() {
     check(Mode::Prefix, "a");
     check(Mode::Suffix, "a");
+}
+
+#[test]
+fn alternatives_agree_with_the_cpu() {
+    // One character: start, end and middle all turn up within a few hundred attempts.
+    for mode in [Mode::Prefix, Mode::Suffix] {
+        let (_, matches, alternatives) = check_grinder(grinder(mode, "a").with_alternatives(10));
+        assert!(matches > 0 && alternatives > 0);
+    }
+    let (_, _, alternatives) = check_grinder(grinder(Mode::Contains, "a").with_alternatives(10));
+    assert_eq!(alternatives, 0, "contains has no other positions");
 }
 
 #[test]

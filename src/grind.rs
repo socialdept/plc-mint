@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -74,6 +74,49 @@ impl Rule {
     }
 }
 
+/// Where the match value landed in an identifier that missed the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Position {
+    Start,
+    End,
+    Middle,
+}
+
+impl Position {
+    pub const ALL: [Self; 3] = [Self::Start, Self::End, Self::Middle];
+}
+
+/// The outcome of one attempt. `code()` is the number the GPU kernel uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Miss,
+    Target,
+    Alternative(Position),
+}
+
+impl Verdict {
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Miss => 0,
+            Self::Target => 1,
+            Self::Alternative(Position::Start) => 2,
+            Self::Alternative(Position::End) => 3,
+            Self::Alternative(Position::Middle) => 4,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            1 => Self::Target,
+            2 => Self::Alternative(Position::Start),
+            3 => Self::Alternative(Position::End),
+            4 => Self::Alternative(Position::Middle),
+            _ => Self::Miss,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hit {
@@ -82,6 +125,9 @@ pub struct Hit {
     pub attempts: u64,
     pub elapsed_ms: u128,
     pub rate: f64,
+    /// Set on alternatives: where the value sits instead of the target position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<Position>,
 }
 
 /// When to give up without a hit. Both are checked with up to `threads * CHUNK`
@@ -109,6 +155,8 @@ pub struct Grinder {
     pub(crate) template: Vec<u8>,
     pub(crate) slot: usize,
     base32: Encoding,
+    /// Alternatives to keep per position; 0 means only the target counts.
+    pub(crate) alternatives: usize,
 }
 
 impl Grinder {
@@ -151,17 +199,51 @@ impl Grinder {
             .context("could not locate the signature slot in the template")?
             + 2;
 
-        Ok(Self { key, op, rule: job.rule, digest, template, slot, base32: op::base32() })
+        Ok(Self { key, op, rule: job.rule, digest, template, slot, base32: op::base32(), alternatives: 0 })
+    }
+
+    /// Also report the value in other positions than the target (prefix or suffix
+    /// only), keeping up to `per_position` of each. All of them share this job's
+    /// keys, so at most one may ever be published.
+    pub fn with_alternatives(mut self, per_position: usize) -> Self {
+        if !matches!(self.rule.mode, Mode::Contains) {
+            self.alternatives = per_position;
+        }
+        self
     }
 
     /// Writes `sig` into the template, hashes it and checks the identifier.
     pub fn check(&mut self, sig: &[u8; 64]) -> bool {
+        self.verdict(sig) == Verdict::Target
+    }
+
+    /// Like `check`, but also says where the value landed when it missed the target.
+    pub fn verdict(&mut self, sig: &[u8; 64]) -> Verdict {
         BASE64URL_NOPAD.encode_mut(sig, &mut self.template[self.slot..self.slot + SIG_LEN]);
         let hash = Sha256::digest(&self.template);
 
         let mut identifier = [0u8; 24];
         self.base32.encode_mut(&hash[..15], &mut identifier);
-        self.rule.matches(&identifier)
+        self.classify(&identifier)
+    }
+
+    fn classify(&self, identifier: &[u8]) -> Verdict {
+        if self.rule.matches(identifier) {
+            return Verdict::Target;
+        }
+        if self.alternatives == 0 {
+            return Verdict::Miss;
+        }
+        let value = self.rule.value.as_bytes();
+        if identifier.starts_with(value) {
+            Verdict::Alternative(Position::Start)
+        } else if identifier.ends_with(value) {
+            Verdict::Alternative(Position::End)
+        } else if identifier.windows(value.len()).any(|w| w == value) {
+            Verdict::Alternative(Position::Middle)
+        } else {
+            Verdict::Miss
+        }
     }
 
     /// A signer for this job's key and digest. Each worker needs its own.
@@ -170,7 +252,8 @@ impl Grinder {
     }
 
     /// Grinds on `threads` workers until a hit or a limit. `report` gets the running
-    /// attempt total roughly every `every`.
+    /// attempt total roughly every `every`; `alternative` gets each kept alternative
+    /// as it is found (see `with_alternatives`).
     pub fn run(
         &self,
         threads: usize,
@@ -178,17 +261,21 @@ impl Grinder {
         limits: Limits,
         every: Duration,
         mut report: impl FnMut(u64, Duration),
+        mut alternative: impl FnMut(Hit) -> Result<()>,
     ) -> Result<Outcome> {
         let start = Instant::now();
         let stop = AtomicBool::new(false);
         let total = AtomicU64::new(0);
         let found: Mutex<Option<[u8; 64]>> = Mutex::new(None);
         let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let kept = Position::ALL.map(|_| AtomicUsize::new(0));
+        let alternatives: Mutex<Vec<([u8; 64], Position)>> = Mutex::new(Vec::new());
 
         thread::scope(|scope| {
             for _ in 0..threads.max(1) {
                 let mut worker = self.clone();
-                let (stop, total, found, failure) = (&stop, &total, &found, &failure);
+                let (stop, total, found, failure, kept, alternatives) =
+                    (&stop, &total, &found, &failure, &kept, &alternatives);
                 scope.spawn(move || {
                     let mut signer = worker.signer(nonce);
                     let mut sigs = [[0u8; 64]; CHUNK];
@@ -201,10 +288,18 @@ impl Grinder {
                         let mut done = 0;
                         for sig in &sigs {
                             done += 1;
-                            if worker.check(sig) {
-                                found.lock().unwrap().get_or_insert(*sig);
-                                stop.store(true, Ordering::Relaxed);
-                                break;
+                            match worker.verdict(sig) {
+                                Verdict::Miss => {}
+                                Verdict::Target => {
+                                    found.lock().unwrap().get_or_insert(*sig);
+                                    stop.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                Verdict::Alternative(position) => {
+                                    if kept[position as usize].fetch_add(1, Ordering::Relaxed) < worker.alternatives {
+                                        alternatives.lock().unwrap().push((*sig, position));
+                                    }
+                                }
                             }
                         }
                         total.fetch_add(done, Ordering::Relaxed);
@@ -216,6 +311,13 @@ impl Grinder {
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(POLL);
                 let attempts = total.load(Ordering::Relaxed);
+                let caught = std::mem::take(&mut *alternatives.lock().unwrap());
+                for (sig, position) in caught {
+                    if let Err(e) = self.hit(&sig, attempts, start.elapsed(), Some(position)).and_then(&mut alternative) {
+                        failure.lock().unwrap().get_or_insert(e);
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
                 if limits.max_attempts.is_some_and(|max| attempts >= max)
                     || limits.deadline.is_some_and(|deadline| Instant::now() >= deadline)
                 {
@@ -234,19 +336,24 @@ impl Grinder {
         let elapsed = start.elapsed();
         let attempts = total.into_inner();
         let hit = match found.into_inner().unwrap() {
-            Some(sig) => {
-                let (did, signed_op) = self.finish(&sig)?;
-                Some(Hit {
-                    did,
-                    signed_op,
-                    attempts,
-                    elapsed_ms: elapsed.as_millis(),
-                    rate: attempts as f64 / elapsed.as_secs_f64(),
-                })
-            }
+            Some(sig) => Some(self.hit(&sig, attempts, elapsed, None)?),
             None => None,
         };
         Ok(Outcome { hit, attempts, elapsed })
+    }
+
+    /// A verified `Hit` for `sig`, found after `attempts` in `elapsed`.
+    pub(crate) fn hit(&self, sig: &[u8; 64], attempts: u64, elapsed: Duration, position: Option<Position>) -> Result<Hit> {
+        let expected = position.map_or(Verdict::Target, Verdict::Alternative);
+        let (did, signed_op) = self.finish(sig, expected)?;
+        Ok(Hit {
+            did,
+            signed_op,
+            attempts,
+            elapsed_ms: elapsed.as_millis(),
+            rate: attempts as f64 / elapsed.as_secs_f64(),
+            position,
+        })
     }
 
     /// Single-threaded nanoseconds per signature for each nonce mode, and per check
@@ -277,13 +384,13 @@ impl Grinder {
 
     /// Builds the signed op from scratch and re-verifies it independently of the
     /// template, so a template bug can never produce a wrong result.
-    pub(crate) fn finish(&self, sig: &[u8; 64]) -> Result<(String, Value)> {
+    pub(crate) fn finish(&self, sig: &[u8; 64], expected: Verdict) -> Result<(String, Value)> {
         let mut signed = self.op.clone();
         signed["sig"] = Value::String(BASE64URL_NOPAD.encode(sig));
 
         let did = op::did_for(&signed)?;
-        let identifier = did.trim_start_matches("did:plc:");
-        ensure!(self.rule.matches(identifier.as_bytes()), "re-encoded DID {did} does not match the rule");
+        let verdict = self.classify(did.trim_start_matches("did:plc:").as_bytes());
+        ensure!(verdict == expected, "re-encoded DID {did} is {verdict:?}, expected {expected:?}");
         op::verify_genesis(&signed).context("ground signature failed verification")?;
 
         Ok((did, signed))

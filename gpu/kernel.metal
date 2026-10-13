@@ -8,7 +8,8 @@
 // point k*G. Per chunk it walks BATCH consecutive nonces (R_i = R_{i-1} + G),
 // batch-inverts the point Z coordinates and the nonces (Montgomery's trick), then
 // signs, hashes and matches each. Same nonce-safety rules as the CPU incremental
-// signer: only the hit ever leaves the GPU.
+// signer: only hits (and alternatives, of which at most one is ever published)
+// leave the GPU.
 //
 // 256-bit numbers are 8 x 32-bit limbs, least significant first.
 
@@ -38,6 +39,7 @@ struct Params {
     uint len;         // match length
     uint chunks;      // chunks of BATCH attempts per thread per dispatch
     uint debug;       // nonzero: write every attempt to dbg
+    uint alt;         // nonzero: report the value in non-target positions too
     uint value[24];   // match characters
     uint sched[384];  // SHA-256 message schedules (64 words) of the constant blocks 2..7
 };
@@ -404,8 +406,20 @@ inline uint sig_byte(U256 r, U256 s, uint j) {
     return (x.v[7 - (k >> 2)] >> (24 - 8 * (k & 3))) & 0xFF;
 }
 
-// Writes the signature into the message, hashes it and matches the identifier.
-inline bool check(CONST Params& P, U256 r, U256 s) {
+inline bool match_at(LOCAL const uint* id, CONST Params& P, uint start) {
+    for (uint i = 0; i < P.len; i++) if (id[start + i] != P.value[i]) return false;
+    return true;
+}
+
+// Verdict codes, as grind::Verdict::code on the host.
+#define MISS 0u
+#define TARGET 1u
+#define AT_START 2u
+#define AT_END 3u
+#define IN_MIDDLE 4u
+
+// Writes the signature into the message, hashes it and classifies the identifier.
+inline uint check(CONST Params& P, U256 r, U256 s) {
     uint msg[32];
     for (int i = 0; i < 32; i++) msg[i] = P.tmpl[i];
 
@@ -438,35 +452,55 @@ inline bool check(CONST Params& P, U256 r, U256 s) {
         id[i] = b32((uint)(pair >> (59 - off)) & 31);
     }
 
+    // Target first, then (with alt) the other positions: start, end, middle.
     uint len = P.len;
     if (P.mode == 0) {
-        for (uint i = 0; i < len; i++) if (id[i] != P.value[i]) return false;
-        return true;
+        if (match_at(id, P, 0)) return TARGET;
+        if (P.alt == 0) return MISS;
+    } else if (P.mode == 1) {
+        if (match_at(id, P, 24 - len)) return TARGET;
+        if (P.alt == 0) return MISS;
     }
-    if (P.mode == 1) {
-        for (uint i = 0; i < len; i++) if (id[24 - len + i] != P.value[i]) return false;
-        return true;
+    // In contains mode every position is the target.
+    bool any = P.mode == 2;
+    if (P.mode != 0 && match_at(id, P, 0)) return any ? TARGET : AT_START;
+    if (P.mode != 1 && match_at(id, P, 24 - len)) return any ? TARGET : AT_END;
+    for (uint start = 1; start + len < 24; start++) {
+        if (match_at(id, P, start)) return any ? TARGET : IN_MIDDLE;
     }
-    for (uint start = 0; start + len <= 24; start++) {
-        bool ok = true;
-        for (uint i = 0; i < len && ok; i++) ok = id[start + i] == P.value[i];
-        if (ok) return true;
-    }
-    return false;
+    return MISS;
 }
 
 // --- the per-thread loop ------------------------------------------------------
 
-inline void record_hit(DEVICE uint* hit, uint tid, U256 r, U256 s) {
+// Hit buffer: [0] target count, [1] thread id, [2..18) r and s of the first target
+// hit; [18] alternative count, then ALT_SLOTS records of verdict, r, s.
+#define ALT_SLOTS 16u
+
+inline uint bump(DEVICE uint* counter) {
 #ifdef __METAL_VERSION__
-    if (atomic_fetch_add_explicit((device atomic_uint*)hit, 1u, memory_order_relaxed) != 0) return;
+    return atomic_fetch_add_explicit((device atomic_uint*)counter, 1u, memory_order_relaxed);
 #else
-    if (hit[0]++ != 0) return;
+    return (*counter)++;
 #endif
-    hit[1] = tid;
+}
+
+inline void record_hit(DEVICE uint* hit, uint tid, uint verdict, U256 r, U256 s) {
+    DEVICE uint* out;
+    if (verdict == TARGET) {
+        if (bump(hit) != 0) return;
+        hit[1] = tid;
+        out = hit + 2;
+    } else {
+        uint slot = bump(hit + 18);
+        if (slot >= ALT_SLOTS) return;
+        out = hit + 19 + slot * 17;
+        out[0] = verdict;
+        out += 1;
+    }
     for (int i = 0; i < 8; i++) {
-        hit[2 + i] = r.v[i];
-        hit[10 + i] = s.v[i];
+        out[i] = r.v[i];
+        out[8 + i] = s.v[i];
     }
 }
 
@@ -537,16 +571,16 @@ inline void run_thread(CONST Params& P, LOCAL U256& k, LOCAL U256& x, LOCAL U256
             }
             if (u_is_zero(r) || u_is_zero(s)) continue;
 
-            bool matched = check(P, r, s);
+            uint verdict = check(P, r, s);
             if (P.debug != 0) {
                 DEVICE uint* out = dbg + ((tid * P.chunks + chunk) * BATCH + (uint)i) * 17;
                 for (int j = 0; j < 8; j++) {
                     out[j] = r.v[j];
                     out[8 + j] = s.v[j];
                 }
-                out[16] = matched ? 1 : 0;
+                out[16] = verdict;
             }
-            if (matched) record_hit(hit, tid, r, s);
+            if (verdict != MISS) record_hit(hit, tid, verdict, r, s);
         }
 
         // Advance to the next chunk: affine R_BATCH and k + BATCH.

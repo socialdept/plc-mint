@@ -31,7 +31,7 @@ fn job_grinds_with_the_written_keys() {
     let job: Job = serde_json::from_value(init.job).unwrap();
     let outcome = Grinder::new(job)
         .unwrap()
-        .run(2, NonceMode::Rfc6979, Limits::default(), Duration::from_secs(60), |_, _| {})
+        .run(2, NonceMode::Rfc6979, Limits::default(), Duration::from_secs(60), |_, _| {}, |_| Ok(()))
         .unwrap();
     let hit = outcome.hit.unwrap();
     assert!(hit.did.starts_with("did:plc:a"));
