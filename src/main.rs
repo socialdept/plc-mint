@@ -97,7 +97,7 @@ struct GpuArgs {
     #[arg(long)]
     gpu: bool,
     /// GPU: nonces per thread per batched inversion.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     gpu_batch: usize,
     /// GPU: threads per dispatch.
     #[arg(long, default_value_t = 65536)]

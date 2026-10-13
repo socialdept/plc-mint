@@ -77,6 +77,14 @@ $B grind --job job.json --gpu
 
 The same kernel source compiles as C++ (`gpu/cpu_ref.cpp`), so its math is tested on any machine: `cargo test --features gpu-ref` checks that every signature verifies, uses exactly nonce `k_thread + i`, and gets the CPU's match verdict, across dispatches. It also checks every field and scalar operation (multiply, square, add, subtract, inverse) against k256 on edge values and 3,000 random inputs each.
 
+Apple M1 Max GPU, 65,536 threads, 20 s runs (after the arithmetic optimizations below):
+
+| `--gpu-batch` | 16 | 32 | 64 | 128 | 256 |
+| --- | --- | --- | --- | --- | --- |
+| Attempts/s | 7.6M | 10.4M | **15.8M** | 12.5M | 14.3M |
+
+Batch 64 is the default: below it the per-batch inversions dominate, above it per-thread memory does.
+
 Kernel arithmetic: 8 x 32-bit limbs; a straight-line reduction specialized for p = 2^256 - 2^32 - 977; dedicated squaring (36 partial products instead of 64); field inversion by libsecp256k1's addition chain (255 squarings, 15 multiplications); scalar inversion with a 4-bit window; SHA-256 schedules of the six constant blocks precomputed on the host.
 
 ### Correctness
