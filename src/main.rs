@@ -70,7 +70,7 @@ enum Command {
         #[command(flatten)]
         gpu: GpuArgs,
         /// Chunks per thread per dispatch.
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = 1)]
         chunks: u32,
     },
     /// Single-threaded cost per signature for each nonce mode, and per hash check.

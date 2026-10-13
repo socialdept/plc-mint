@@ -168,17 +168,48 @@ pub fn alternatives(hit: &[u32]) -> Vec<([u8; 64], Position)> {
 
 /// Checks every attempt the kernel recorded: the signature verifies (low-S) under
 /// the grind key, r is unique, and the kernel's match verdict agrees with the CPU's.
-pub fn verify_debug(grinder: &Grinder, dbg: &[u32], seen_r: &mut HashSet<[u8; 32]>) -> Result<DebugReport> {
+/// `seen_r` holds the first 16 bytes of every r so far, across dispatches.
+pub fn verify_debug(grinder: &Grinder, dbg: &[u32], seen_r: &mut HashSet<u128>) -> Result<DebugReport> {
+    let records = dbg.len() / DEBUG_WORDS;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per_worker = records.div_ceil(workers).max(1);
+
+    // Signature and verdict checks on every core; the r uniqueness check after.
+    let parts: Vec<Result<(DebugReport, Vec<u128>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = dbg
+            .chunks(per_worker * DEBUG_WORDS)
+            .enumerate()
+            .map(|(part, words)| scope.spawn(move || verify_part(grinder, words, part * per_worker)))
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("verify worker panicked")).collect()
+    });
+
+    let mut report = DebugReport::default();
+    for part in parts {
+        let (part, rs) = part?;
+        report.signatures += part.signatures;
+        report.matches += part.matches;
+        report.alternatives += part.alternatives;
+        for r in rs {
+            ensure!(seen_r.insert(r), "repeated r (nonce reuse)");
+        }
+    }
+    Ok(report)
+}
+
+fn verify_part(grinder: &Grinder, dbg: &[u32], first: usize) -> Result<(DebugReport, Vec<u128>)> {
     let key = grinder.key.verifying_key();
     let mut cpu = grinder.clone();
     let mut report = DebugReport::default();
+    let mut rs = Vec::with_capacity(dbg.len() / DEBUG_WORDS);
 
     for (i, record) in dbg.chunks_exact(DEBUG_WORDS).enumerate() {
+        let i = first + i;
         let sig = sig_bytes(&record[..16]);
         let parsed = Signature::from_slice(&sig).map_err(|e| anyhow::anyhow!("attempt {i}: malformed signature: {e}"))?;
         key.verify_prehash(&grinder.digest, &parsed)
             .map_err(|_| anyhow::anyhow!("attempt {i}: signature does not verify"))?;
-        ensure!(seen_r.insert(sig[..32].try_into().unwrap()), "attempt {i}: repeated r (nonce reuse)");
+        rs.push(u128::from_be_bytes(sig[..16].try_into().unwrap()));
 
         let verdict = Verdict::from_code(record[16]);
         ensure!(verdict == cpu.verdict(&sig), "attempt {i}: kernel verdict {verdict:?} disagrees with the CPU");
@@ -186,7 +217,7 @@ pub fn verify_debug(grinder: &Grinder, dbg: &[u32], seen_r: &mut HashSet<[u8; 32
         report.matches += (verdict == Verdict::Target) as usize;
         report.alternatives += matches!(verdict, Verdict::Alternative(_)) as usize;
     }
-    Ok(report)
+    Ok((report, rs))
 }
 
 #[cfg(feature = "gpu-ref")]
@@ -308,8 +339,9 @@ pub mod metal_backend {
 
             let mut seen = HashSet::new();
             let mut total = DebugReport::default();
-            for _ in 0..2 {
+            for dispatch in 1..=2 {
                 self.dispatch(&params, &state, &hit, &dbg);
+                eprintln!("dispatch {dispatch}/2: checking {records} signatures on the CPU");
                 let report = super::verify_debug(grinder, Self::words(&dbg, records * DEBUG_WORDS), &mut seen)?;
                 total.signatures += report.signatures;
                 total.matches += report.matches;
