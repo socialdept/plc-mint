@@ -110,6 +110,16 @@ fn alternatives_agree_with_the_cpu() {
 }
 
 #[test]
+fn glob_mode_agrees_with_the_cpu() {
+    // Every attempt's verdict is compared, so misses count as much as hits.
+    let mut matches = 0;
+    for pattern in ["a*b", "^a*", "*a$", "^a*b$", "a*b*c*d", "^*ab*$", "aa*aa"] {
+        matches += check(Mode::Glob, pattern).1;
+    }
+    assert!(matches > 0);
+}
+
+#[test]
 fn finds_and_records_a_hit() {
     // One character anywhere matches about half the time, so 128 attempts hit.
     let (_, matches) = check(Mode::Contains, "a");

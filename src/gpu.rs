@@ -79,6 +79,7 @@ pub fn params(grinder: &Grinder, chunks: u32, debug: bool) -> Result<Params> {
             Mode::Prefix => 0,
             Mode::Suffix => 1,
             Mode::Contains => 2,
+            Mode::Glob => 3,
         },
         len: rule.value.len() as u32,
         chunks,

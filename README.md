@@ -39,7 +39,17 @@ Patterns use `a-z` and `2-7` only (no `0`, `1`, `8`, `9`). `prefix` and `suffix`
 | 7 | 34B | 9.5 h | 76 min | 36 min |
 | 8 | 1.1T | 13 days | 41 h | 19 h |
 
-`contains` divides these by roughly `25 - length` (about 19x for 6 characters). Measure your own machine with `plc-mint bench --nonce incremental --seconds 20` (or `--gpu`).
+`contains` divides these by roughly `25 - length` (about 19x for 6 characters).
+
+**Globs** split a longer name into pieces that may land apart: `*` stands for any run of characters (including none), and the pattern may sit anywhere unless it starts with `^` or ends with `$`. Count only the letters for the row in the table, then divide by the number of ways the pieces fit: `C(24 - letters + k, k)`, where `k` is the number of pieces not pinned by `^` or `$`.
+
+| Pattern | Letters | Divide by | M1 Max GPU |
+| --- | --- | --- | --- |
+| `gaygaygay` (prefix) | 9 | 1 | ~25 days |
+| `^gay*gay*gay$` | 9 | `C(16, 1)` = 16 | ~1.6 days |
+| `gay*gay*gay` | 9 | `C(18, 3)` = 816 | ~45 min |
+
+Measure your own machine with `plc-mint bench --nonce incremental --seconds 20` (or `--gpu`).
 
 ### 2–3 in one go
 
@@ -48,6 +58,8 @@ plc-mint mint --mode prefix --value alice --out ./alice --gpu   # or --nonce inc
 ```
 
 `mint` is `init` followed by `grind`: it writes `keys.json` and `job.json` first, then `hit.json` once it finds a match, and prints the DID. It takes the options of both. If you stop it midway, `plc-mint grind --job alice/job.json` picks up the same job (a fresh search; the odds don't depend on how long it already ran).
+
+Any value with `*`, `^` or `$` is a glob, so `--mode glob` is optional: `plc-mint mint --value 'gay*gay*gay' --out ./gay --gpu` (quote it, or the shell expands the `*`).
 
 **Alternatives while you wait.** For a prefix or suffix, `mint` also saves DIDs where the value lands somewhere else, as they turn up:
 
@@ -124,7 +136,7 @@ plc-mint example-job --mode prefix --value mig     # throwaway job for testing; 
 
 | Command | Purpose |
 | --- | --- |
-| `init --mode --value --out DIR [--recovery did:key]` | Writes `DIR/keys.json` and `DIR/job.json` (mode 0600, never overwritten). The value is lowercased and validated. |
+| `init [--mode] --value --out DIR [--recovery did:key]` | Writes `DIR/keys.json` and `DIR/job.json` (mode 0600, never overwritten). The value is lowercased and validated. `--mode` is `prefix`, `suffix`, `contains` or `glob`; without it, a value with `*`, `^` or `$` is a glob and anything else a prefix. |
 | `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--nonce MODE` (default `rfc6979`), `--gpu`, `--max-attempts N` gives up with exit code 2, `--save-alternatives DIR` saves alternatives (up to `--alternatives N` per position). Progress goes to stderr. |
 | `mint` | `init`, then `grind` on the new job; writes `DIR/hit.json` and prints the DID, saving alternatives to `DIR/alternatives/` as they turn up. Takes the options of both. |
 | `bench` | Grinds a never-matching job for `--seconds` at every combination of `--nonce a,b` (default: all) and `--threads 1,6,12`, one JSON line per run: `{nonce, threads, seconds, attempts, rate, ratePerThread}`. |
@@ -148,11 +160,11 @@ plc-mint example-job --mode prefix --value mig     # throwaway job for testing; 
     "prev": null
   },
   "signingKey": "<hex secp256k1 private key; its did:key must be in rotationKeys>",
-  "match": { "mode": "prefix | contains | suffix", "value": "mig" }
+  "match": { "mode": "prefix | contains | suffix | glob", "value": "mig" }
 }
 ```
 
-`init` writes this for you. Output: `{did, signedOp, attempts, elapsedMs, rate}`. The match value may only use `a-z` and `2-7`.
+`init` writes this for you. Output: `{did, signedOp, attempts, elapsedMs, rate}`. The match value may only use `a-z` and `2-7`, plus `*` and a leading `^` or trailing `$` in a glob (24 characters at most in all).
 
 ### Nonce modes
 
@@ -177,7 +189,7 @@ $B bench --gpu --seconds 60 [--gpu-batch 32] [--gpu-threads 16384]
 $B grind --job job.json --gpu
 ```
 
-The same kernel source compiles as C++ (`gpu/cpu_ref.cpp`), so its math is tested on any machine: `cargo test --features gpu-ref` checks that every signature verifies, uses exactly nonce `k_thread + i`, and gets the CPU's match verdict, across dispatches. It also checks every field and scalar operation (multiply, square, add, subtract, inverse) against k256 on edge values and 3,000 random inputs each.
+The same kernel source compiles as C++ (`gpu/cpu_ref.cpp`), so its math is tested on any machine: `cargo test --features gpu-ref` checks that every signature verifies, uses exactly nonce `k_thread + i`, and gets the CPU's match verdict in every mode, globs included, across dispatches. It also checks every field and scalar operation (multiply, square, add, subtract, inverse) against k256 on edge values and 3,000 random inputs each.
 
 Apple M1 Max GPU, 65,536 threads, 20 s runs (after the arithmetic optimizations below):
 
@@ -195,6 +207,7 @@ Every hit is rebuilt from scratch (not from the hot-loop template), re-hashed an
 
 - **Golden:** reproduce real DIDs from their `plc.directory` genesis ops byte for byte and verify their signatures (`tests/fixtures/`).
 - **Encoder:** the DAG-CBOR encoder agrees with `serde_ipld_dagcbor`.
+- **Globs:** the leftmost-first matcher (also in the GPU kernel) agrees with a backtracking matcher on 200k random patterns and identifiers.
 - **Grind:** ground ops from every nonce mode verify under libsecp256k1, which shares no code with the RustCrypto signer and rejects high-S.
 - **Signers:** every signature a signer emits, not just hits, verifies under libsecp256k1 and is unique, across batch boundaries; separate signers never share nonces.
 

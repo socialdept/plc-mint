@@ -52,14 +52,34 @@ pub enum Mode {
     Prefix,
     Contains,
     Suffix,
+    /// `*` matches any run of characters (including none). The pattern may sit
+    /// anywhere unless it starts with `^` or ends with `$`.
+    Glob,
 }
+
+/// Characters with a meaning in glob patterns.
+pub const GLOB_CHARS: &str = "*^$";
 
 impl Rule {
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.value.is_empty(), "match value is empty");
         ensure!(self.value.len() <= 24, "match value is longer than 24 characters");
-        if let Some(c) = self.value.chars().find(|c| !ALPHABET.contains(*c)) {
+        let glob = matches!(self.mode, Mode::Glob);
+        if let Some(c) = self.value.chars().find(|c| !ALPHABET.contains(*c) && !(glob && GLOB_CHARS.contains(*c))) {
+            if GLOB_CHARS.contains(c) {
+                bail!("'{c}' is a glob character: use --mode glob");
+            }
             bail!("'{c}' can never appear in a did:plc (allowed: a-z, 2-7)");
+        }
+        if glob {
+            let body = self.value.strip_prefix('^').unwrap_or(&self.value);
+            let body = body.strip_suffix('$').unwrap_or(body);
+            ensure!(!body.contains(['^', '$']), "'^' may only start a glob and '$' only end it");
+            let letters = body.chars().filter(|c| *c != '*').count();
+            ensure!(letters > 0, "glob has no characters to match");
+            if self.value.starts_with('^') && self.value.ends_with('$') && !body.contains('*') {
+                ensure!(letters == 24, "glob pins both ends with no '*', so it needs exactly 24 characters");
+            }
         }
         Ok(())
     }
@@ -70,8 +90,42 @@ impl Rule {
             Mode::Prefix => identifier.starts_with(value),
             Mode::Suffix => identifier.ends_with(value),
             Mode::Contains => identifier.windows(value.len()).any(|w| w == value),
+            Mode::Glob => glob_matches(value, identifier),
         }
     }
+}
+
+/// Matches segments leftmost-first, which is exact for patterns whose only
+/// wildcard is `*`. The GPU kernel's `glob_match` is the same algorithm.
+fn glob_matches(pattern: &[u8], identifier: &[u8]) -> bool {
+    let (start, pattern) = pattern.strip_prefix(b"^").map_or((false, pattern), |p| (true, p));
+    let (end, pattern) = pattern.strip_suffix(b"$").map_or((false, pattern), |p| (true, p));
+    let segments: Vec<&[u8]> = pattern.split(|c| *c == b'*').collect();
+    let last = segments.len() - 1;
+    let mut pos = 0;
+    for (i, segment) in segments.into_iter().enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+        let at = if i == 0 && start {
+            if !identifier.starts_with(segment) || (i == last && end && segment.len() != identifier.len()) {
+                return false;
+            }
+            0
+        } else if i == last && end {
+            match identifier.len().checked_sub(segment.len()) {
+                Some(at) if at >= pos && identifier.ends_with(segment) => at,
+                _ => return false,
+            }
+        } else {
+            match identifier[pos..].windows(segment.len()).position(|w| w == segment) {
+                Some(offset) => pos + offset,
+                None => return false,
+            }
+        };
+        pos = at + segment.len();
+    }
+    true
 }
 
 /// Where the match value landed in an identifier that missed the target.
@@ -206,7 +260,7 @@ impl Grinder {
     /// only), keeping up to `per_position` of each. All of them share this job's
     /// keys, so at most one may ever be published.
     pub fn with_alternatives(mut self, per_position: usize) -> Self {
-        if !matches!(self.rule.mode, Mode::Contains) {
+        if matches!(self.rule.mode, Mode::Prefix | Mode::Suffix) {
             self.alternatives = per_position;
         }
         self

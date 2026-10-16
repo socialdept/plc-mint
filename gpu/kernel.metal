@@ -35,12 +35,12 @@ struct Params {
     uint z[8];        // SHA-256 of the unsigned op, mod n
     uint tmpl[128];   // padded SHA-256 message (8 blocks), big-endian words
     uint slot;        // byte offset of the 86-char signature in the message
-    uint mode;        // 0 prefix, 1 suffix, 2 contains
+    uint mode;        // 0 prefix, 1 suffix, 2 contains, 3 glob
     uint len;         // match length
     uint chunks;      // chunks of BATCH attempts per thread per dispatch
     uint debug;       // nonzero: write every attempt to dbg
     uint alt;         // nonzero: report the value in non-target positions too
-    uint value[24];   // match characters
+    uint value[24];   // match characters (ASCII; a glob keeps its '^', '*' and '$')
     uint sched[384];  // SHA-256 message schedules (64 words) of the constant blocks 2..7
 };
 
@@ -411,6 +411,50 @@ inline bool match_at(LOCAL const uint* id, CONST Params& P, uint start) {
     return true;
 }
 
+inline bool segment_at(LOCAL const uint* id, CONST Params& P, uint from, uint len, uint start) {
+    for (uint i = 0; i < len; i++) if (id[start + i] != P.value[from + i]) return false;
+    return true;
+}
+
+#define STAR 42u   // '*'
+#define CARET 94u  // '^'
+#define DOLLAR 36u // '$'
+
+// grind::glob_matches: segments between '*' matched leftmost-first.
+inline bool glob_match(LOCAL const uint* id, CONST Params& P) {
+    uint i = 0, n = P.len, pos = 0;
+    bool start = P.value[0] == CARET, end = P.value[n - 1] == DOLLAR, first = true;
+    if (start) i = 1;
+    if (end) n--;
+    while (true) {
+        uint j = i;
+        while (j < n && P.value[j] != STAR) j++;
+        uint len = j - i;
+        bool last = j == n;
+        if (len > 0) {
+            uint at = pos;
+            if (first && start) {
+                if (!segment_at(id, P, i, len, 0) || (last && end && len != 24)) return false;
+                at = 0;
+            } else if (last && end) {
+                if (len > 24 || 24 - len < pos) return false;
+                at = 24 - len;
+                if (!segment_at(id, P, i, len, at)) return false;
+            } else {
+                bool found = false;
+                for (; at + len <= 24; at++) {
+                    if (segment_at(id, P, i, len, at)) { found = true; break; }
+                }
+                if (!found) return false;
+            }
+            pos = at + len;
+        }
+        if (last) return true;
+        first = false;
+        i = j + 1;
+    }
+}
+
 // Verdict codes, as grind::Verdict::code on the host.
 #define MISS 0u
 #define TARGET 1u
@@ -451,6 +495,8 @@ inline uint check(CONST Params& P, U256 r, U256 s) {
         ulong pair = ((ulong)h[word] << 32) | (ulong)h[word + 1];
         id[i] = b32((uint)(pair >> (59 - off)) & 31);
     }
+
+    if (P.mode == 3) return glob_match(id, P) ? TARGET : MISS;
 
     // Target first, then (with alt) the other positions: start, end, middle.
     uint len = P.len;

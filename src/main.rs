@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use data_encoding::HEXLOWER;
 use plc_mint::{
     didkey, example,
-    grind::{Grinder, Hit, Job, Limits, Mode, Rule},
+    grind::{GLOB_CHARS, Grinder, Hit, Job, Limits, Mode, Rule},
     init, op,
     signer::NonceMode,
 };
@@ -97,9 +97,10 @@ enum Command {
 
 #[derive(clap::Args)]
 struct InitArgs {
-    #[arg(long, value_enum, default_value = "prefix")]
-    mode: ModeArg,
-    /// The string to look for (a-z, 2-7).
+    /// Default: glob if the value has '*', '^' or '$', else prefix.
+    #[arg(long, value_enum)]
+    mode: Option<ModeArg>,
+    /// The string to look for (a-z, 2-7), or a glob such as `gay*gay*gay`.
     #[arg(long)]
     value: String,
     /// Bring your own recovery key (did:key, k256 or P-256) instead of generating one.
@@ -184,6 +185,7 @@ enum ModeArg {
     Prefix,
     Contains,
     Suffix,
+    Glob,
 }
 
 impl From<ModeArg> for Mode {
@@ -192,6 +194,7 @@ impl From<ModeArg> for Mode {
             ModeArg::Prefix => Mode::Prefix,
             ModeArg::Contains => Mode::Contains,
             ModeArg::Suffix => Mode::Suffix,
+            ModeArg::Glob => Mode::Glob,
         }
     }
 }
@@ -320,7 +323,12 @@ fn main() -> Result<()> {
 
 /// Writes keys.json and job.json for `init` and returns the job.
 fn write_init(args: &InitArgs) -> Result<Value> {
-    let rule = Rule { mode: args.mode.clone().into(), value: args.value.to_lowercase() };
+    let mode = match &args.mode {
+        Some(mode) => mode.clone().into(),
+        None if args.value.contains(|c| GLOB_CHARS.contains(c)) => Mode::Glob,
+        None => Mode::Prefix,
+    };
+    let rule = Rule { mode, value: args.value.to_lowercase() };
     let init = init::init(&rule, args.recovery.as_deref())?;
     let out = &args.out;
     std::fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
