@@ -41,13 +41,14 @@ Patterns use `a-z` and `2-7` only (no `0`, `1`, `8`, `9`). `prefix` and `suffix`
 
 `contains` divides these by roughly `25 - length` (about 19x for 6 characters).
 
-**Globs** split a longer name into pieces that may land apart: `*` stands for any run of characters (including none), and the pattern may sit anywhere unless it starts with `^` or ends with `$`. Count only the letters for the row in the table, then divide by the number of ways the pieces fit: `C(24 - letters + k, k)`, where `k` is the number of pieces not pinned by `^` or `$`.
+**Globs** split a longer name into pieces that may land apart: `*` stands for any run of characters (including none), `_` for exactly one character, and the pattern may sit anywhere unless it starts with `^` or ends with `$`. Count only the letters for the row in the table (a `_` is free), then divide by the number of ways the pieces fit: `C(24 - width + k, k)`, where `width` is the letters plus `_`s and `k` is the number of pieces not pinned by `^` or `$`.
 
 | Pattern | Letters | Divide by | M1 Max GPU |
 | --- | --- | --- | --- |
 | `gaygaygay` (prefix) | 9 | 1 | ~25 days |
 | `^gay*gay*gay$` | 9 | `C(16, 1)` = 16 | ~1.6 days |
 | `gay*gay*gay` | 9 | `C(18, 3)` = 816 | ~45 min |
+| `gay__gay` | 6 | `C(17, 1)` = 17 | ~4 s |
 
 Measure your own machine with `plc-mint bench --nonce incremental --seconds 20` (or `--gpu`).
 
@@ -59,7 +60,7 @@ plc-mint mint --mode prefix --value alice --out ./alice --gpu   # or --nonce inc
 
 `mint` is `init` followed by `grind`: it writes `keys.json` and `job.json` first, then `hit.json` once it finds a match, and prints the DID. It takes the options of both. If you stop it midway, `plc-mint grind --job alice/job.json` picks up the same job (a fresh search; the odds don't depend on how long it already ran).
 
-Any value with `*`, `^` or `$` is a glob, so `--mode glob` is optional: `plc-mint mint --value 'gay*gay*gay' --out ./gay --gpu` (quote it, or the shell expands the `*`).
+Any value with `*`, `_`, `^` or `$` is a glob, so `--mode glob` is optional: `plc-mint mint --value 'gay*gay*gay' --out ./gay --gpu` (quote it, or the shell expands the `*`).
 
 **Alternatives while you wait.** For a prefix or suffix, `mint` also saves DIDs where the value lands somewhere else, as they turn up:
 
@@ -136,7 +137,7 @@ plc-mint example-job --mode prefix --value mig     # throwaway job for testing; 
 
 | Command | Purpose |
 | --- | --- |
-| `init [--mode] --value --out DIR [--recovery did:key]` | Writes `DIR/keys.json` and `DIR/job.json` (mode 0600, never overwritten). The value is lowercased and validated. `--mode` is `prefix`, `suffix`, `contains` or `glob`; without it, a value with `*`, `^` or `$` is a glob and anything else a prefix. |
+| `init [--mode] --value --out DIR [--recovery did:key]` | Writes `DIR/keys.json` and `DIR/job.json` (mode 0600, never overwritten). The value is lowercased and validated. `--mode` is `prefix`, `suffix`, `contains` or `glob`; without it, a value with `*`, `_`, `^` or `$` is a glob and anything else a prefix. |
 | `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--nonce MODE` (default `rfc6979`), `--gpu`, `--max-attempts N` gives up with exit code 2, `--save-alternatives DIR` saves alternatives (up to `--alternatives N` per position). Progress goes to stderr. |
 | `mint` | `init`, then `grind` on the new job; writes `DIR/hit.json` and prints the DID, saving alternatives to `DIR/alternatives/` as they turn up. Takes the options of both. |
 | `bench` | Grinds a never-matching job for `--seconds` at every combination of `--nonce a,b` (default: all) and `--threads 1,6,12`, one JSON line per run: `{nonce, threads, seconds, attempts, rate, ratePerThread}`. |
@@ -164,7 +165,7 @@ plc-mint example-job --mode prefix --value mig     # throwaway job for testing; 
 }
 ```
 
-`init` writes this for you. Output: `{did, signedOp, attempts, elapsedMs, rate}`. The match value may only use `a-z` and `2-7`, plus `*` and a leading `^` or trailing `$` in a glob (24 characters at most in all).
+`init` writes this for you. Output: `{did, signedOp, attempts, elapsedMs, rate}`. The match value may only use `a-z` and `2-7`, plus `*`, `_` and a leading `^` or trailing `$` in a glob (24 characters at most in all).
 
 ### Nonce modes
 

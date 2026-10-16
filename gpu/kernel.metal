@@ -40,7 +40,7 @@ struct Params {
     uint chunks;      // chunks of BATCH attempts per thread per dispatch
     uint debug;       // nonzero: write every attempt to dbg
     uint alt;         // nonzero: report the value in non-target positions too
-    uint value[24];   // match characters (ASCII; a glob keeps its '^', '*' and '$')
+    uint value[24];   // match characters (ASCII; a glob keeps its '^', '*', '_' and '$')
     uint sched[384];  // SHA-256 message schedules (64 words) of the constant blocks 2..7
 };
 
@@ -411,16 +411,20 @@ inline bool match_at(LOCAL const uint* id, CONST Params& P, uint start) {
     return true;
 }
 
-inline bool segment_at(LOCAL const uint* id, CONST Params& P, uint from, uint len, uint start) {
-    for (uint i = 0; i < len; i++) if (id[start + i] != P.value[from + i]) return false;
-    return true;
-}
-
+#define ANY 95u    // '_'
 #define STAR 42u   // '*'
 #define CARET 94u  // '^'
 #define DOLLAR 36u // '$'
 
-// grind::glob_matches: segments between '*' matched leftmost-first.
+inline bool segment_at(LOCAL const uint* id, CONST Params& P, uint from, uint len, uint start) {
+    for (uint i = 0; i < len; i++) {
+        uint c = P.value[from + i];
+        if (c != ANY && id[start + i] != c) return false;
+    }
+    return true;
+}
+
+// grind::glob_matches: segments between '*' matched leftmost-first; '_' is any one character.
 inline bool glob_match(LOCAL const uint* id, CONST Params& P) {
     uint i = 0, n = P.len, pos = 0;
     bool start = P.value[0] == CARET, end = P.value[n - 1] == DOLLAR, first = true;

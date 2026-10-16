@@ -128,6 +128,7 @@ fn glob_reference(pattern: &[u8], id: &[u8]) -> bool {
         match p.split_first() {
             None => !end || s.is_empty(),
             Some((b'*', rest)) => (0..=s.len()).any(|i| here(rest, &s[i..], end)),
+            Some((b'_', rest)) => !s.is_empty() && here(rest, &s[1..], end),
             Some((c, rest)) => s.first() == Some(c) && here(rest, &s[1..], end),
         }
     }
@@ -156,6 +157,12 @@ fn glob_matching() {
         ("^*gay*$", true),
         ("gaygay", false),
         ("^gayxxgayxxxxxxxxxxgayxxx$", true),
+        ("gay__gay", true),
+        ("gay_gay", false),
+        ("^___xxgay", true),
+        ("gay___$", true),
+        ("gay____$", false),
+        ("^_______________________x$", true),
     ] {
         assert_eq!(glob(pattern).matches(id), expected, "{pattern}");
         assert_eq!(glob_reference(pattern.as_bytes(), id), expected, "reference: {pattern}");
@@ -179,7 +186,7 @@ fn glob_agrees_with_a_backtracking_matcher() {
             pattern.push(b'^');
         }
         for _ in 0..1 + next(7) {
-            pattern.push(b"ab*"[next(3) as usize]);
+            pattern.push(b"ab*_"[next(4) as usize]);
         }
         if next(3) == 0 {
             pattern.push(b'$');
@@ -205,7 +212,7 @@ fn grinds_a_glob() {
 
 #[test]
 fn rejects_bad_globs() {
-    for value in ["a^b", "a$b", "***", "^$", "^abc$", "a*1", "a?b"] {
+    for value in ["a^b", "a$b", "***", "^$", "^abc$", "a*1", "a?b", "__*_", "^________________________$"] {
         assert!(glob(value).validate().is_err(), "{value} should be rejected");
     }
     assert!(Rule { mode: Mode::Prefix, value: "a*b".into() }.validate().unwrap_err().to_string().contains("--mode glob"));

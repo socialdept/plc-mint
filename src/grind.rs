@@ -52,13 +52,13 @@ pub enum Mode {
     Prefix,
     Contains,
     Suffix,
-    /// `*` matches any run of characters (including none). The pattern may sit
-    /// anywhere unless it starts with `^` or ends with `$`.
+    /// `*` matches any run of characters (including none) and `_` exactly one.
+    /// The pattern may sit anywhere unless it starts with `^` or ends with `$`.
     Glob,
 }
 
 /// Characters with a meaning in glob patterns.
-pub const GLOB_CHARS: &str = "*^$";
+pub const GLOB_CHARS: &str = "*_^$";
 
 impl Rule {
     pub fn validate(&self) -> Result<()> {
@@ -75,10 +75,10 @@ impl Rule {
             let body = self.value.strip_prefix('^').unwrap_or(&self.value);
             let body = body.strip_suffix('$').unwrap_or(body);
             ensure!(!body.contains(['^', '$']), "'^' may only start a glob and '$' only end it");
-            let letters = body.chars().filter(|c| *c != '*').count();
-            ensure!(letters > 0, "glob has no characters to match");
+            ensure!(body.chars().any(|c| ALPHABET.contains(c)), "glob has no characters to match");
+            let width = body.chars().filter(|c| *c != '*').count();
             if self.value.starts_with('^') && self.value.ends_with('$') && !body.contains('*') {
-                ensure!(letters == 24, "glob pins both ends with no '*', so it needs exactly 24 characters");
+                ensure!(width == 24, "glob pins both ends with no '*', so it needs exactly 24 characters");
             }
         }
         Ok(())
@@ -95,8 +95,9 @@ impl Rule {
     }
 }
 
-/// Matches segments leftmost-first, which is exact for patterns whose only
-/// wildcard is `*`. The GPU kernel's `glob_match` is the same algorithm.
+/// Matches segments leftmost-first, which is exact because every segment has a
+/// fixed width (`_` is one character). The GPU kernel's `glob_match` is the same
+/// algorithm.
 fn glob_matches(pattern: &[u8], identifier: &[u8]) -> bool {
     let (start, pattern) = pattern.strip_prefix(b"^").map_or((false, pattern), |p| (true, p));
     let (end, pattern) = pattern.strip_suffix(b"$").map_or((false, pattern), |p| (true, p));
@@ -107,19 +108,20 @@ fn glob_matches(pattern: &[u8], identifier: &[u8]) -> bool {
         if segment.is_empty() {
             continue;
         }
+        let fits = |at: usize| identifier[at..].iter().zip(segment).all(|(c, p)| *p == b'_' || c == p);
         let at = if i == 0 && start {
-            if !identifier.starts_with(segment) || (i == last && end && segment.len() != identifier.len()) {
+            if segment.len() > identifier.len() || !fits(0) || (i == last && end && segment.len() != identifier.len()) {
                 return false;
             }
             0
         } else if i == last && end {
             match identifier.len().checked_sub(segment.len()) {
-                Some(at) if at >= pos && identifier.ends_with(segment) => at,
+                Some(at) if at >= pos && fits(at) => at,
                 _ => return false,
             }
         } else {
-            match identifier[pos..].windows(segment.len()).position(|w| w == segment) {
-                Some(offset) => pos + offset,
+            match (pos..=identifier.len().saturating_sub(segment.len())).find(|&at| at + segment.len() <= identifier.len() && fits(at)) {
+                Some(at) => at,
                 None => return false,
             }
         };

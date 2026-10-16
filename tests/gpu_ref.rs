@@ -113,7 +113,7 @@ fn alternatives_agree_with_the_cpu() {
 fn glob_mode_agrees_with_the_cpu() {
     // Every attempt's verdict is compared, so misses count as much as hits.
     let mut matches = 0;
-    for pattern in ["a*b", "^a*", "*a$", "^a*b$", "a*b*c*d", "^*ab*$", "aa*aa"] {
+    for pattern in ["a*b", "^a*", "*a$", "^a*b$", "a*b*c*d", "^*ab*$", "aa*aa", "a_b", "^_a*b_$", "__a__"] {
         matches += check(Mode::Glob, pattern).1;
     }
     assert!(matches > 0);

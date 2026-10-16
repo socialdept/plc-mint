@@ -97,10 +97,10 @@ enum Command {
 
 #[derive(clap::Args)]
 struct InitArgs {
-    /// Default: glob if the value has '*', '^' or '$', else prefix.
+    /// Default: glob if the value has '*', '_', '^' or '$', else prefix.
     #[arg(long, value_enum)]
     mode: Option<ModeArg>,
-    /// The string to look for (a-z, 2-7), or a glob such as `gay*gay*gay`.
+    /// The string to look for (a-z, 2-7), or a glob such as `gay*gay*gay` or `gay__gay`.
     #[arg(long)]
     value: String,
     /// Bring your own recovery key (did:key, k256 or P-256) instead of generating one.
