@@ -1,6 +1,6 @@
 # Minting
 
-Part of the [plc-mint docs](../introduction.md#documentation). Picking a pattern, how long it takes, creating keys and a job, grinding, and alternatives.
+Part of the [plc-mint docs](../introduction.md#documentation). Picking a pattern, how long it takes, creating keys and a job, grinding, alternatives, and stocking many DIDs at once.
 
 ## Picking a pattern
 
@@ -37,6 +37,20 @@ Positions are `start`, `end` and `middle`. The value is 15 to 20 times more like
 ### Claim only one DID per job
 
 The hit and all its alternatives share the job's keys and are signed by the same grind key with related nonces. Two of them in public would reveal that key. `plc-claim` refuses to publish one when another from the same job (`hit.json` or `alternatives/` next to `keys.json`) is already on PLC. To get a second DID, run `mint` again.
+
+## Stocking many DIDs
+
+A service that hands out vanity DIDs, such as one that creates accounts on demand, can grind a stock of them ahead of time:
+
+```sh
+plc-mint stock --value abc --count 1000 --recovery did:key:… --out abc.jsonl --nonce incremental
+```
+
+`stock` runs a fresh `init` and `grind` for every DID and appends one line per hit: `{did, signedOp, keys}`, where `keys` has the same shape as `keys.json`. Each DID has its own grind and temp signing keys, so every grind key signs exactly one op, and the [one DID per job](#claim-only-one-did-per-job) rule holds for every line. Stop it whenever you like. A rerun counts the lines already in the file and grinds only the rest.
+
+Pass `--recovery` with the service's own rotation key, so the service controls every DID it hands out while the grinding machine only ever sees the public half. Nothing in the file is on PLC yet, so an unused line costs nothing. Keep the file secret all the same, since its grind keys can still publish and rotate their DIDs.
+
+Short patterns are cheap: a 3-character prefix takes about 33,000 attempts per DID, so 1,000 of them take under a minute on a laptop CPU.
 
 ## The two steps separately
 

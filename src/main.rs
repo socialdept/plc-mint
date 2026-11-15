@@ -48,6 +48,27 @@ enum Command {
         #[command(flatten)]
         grind: GrindArgs,
     },
+    /// Grind many DIDs, each with its own keys, appending one JSON line per DID to a file.
+    /// Run it again to resume: lines already in the file count towards --count.
+    Stock {
+        #[arg(long, value_enum, default_value = "prefix")]
+        mode: ModeArg,
+        /// The string to look for (a-z, 2-7).
+        #[arg(long)]
+        value: String,
+        /// Recovery key (did:key, k256 or P-256) placed first in every DID's rotationKeys.
+        /// Without it, each line gets a freshly generated one.
+        #[arg(long)]
+        recovery: Option<String>,
+        /// How many DIDs the file should hold.
+        #[arg(long)]
+        count: usize,
+        /// JSON Lines file to append to, created (mode 0600) if missing.
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        grind: GrindArgs,
+    },
     /// Measure sustained attempts per second against a job that never matches.
     Bench {
         /// Seconds per run.
@@ -216,6 +237,9 @@ fn main() -> Result<()> {
             eprintln!("wrote {}", path.display());
             println!("{}", hit.did);
         }
+        Command::Stock { mode, value, recovery, count, out, grind: args } => {
+            stock(Rule { mode: mode.into(), value: value.to_lowercase() }, recovery.as_deref(), count, &out, &args)?;
+        }
         Command::Bench { seconds, threads, nonce, report_every, gpu: gpu_args } => {
             let threads = if threads.is_empty() { vec![logical_cpus()] } else { threads };
             let modes = if nonce.is_empty() { NonceMode::ALL.to_vec() } else { nonce };
@@ -362,6 +386,77 @@ fn grind(job: Job, args: &GrindArgs, alternatives: Option<&Path>) -> Result<Hit>
         eprintln!("no match within --max-attempts");
         std::process::exit(2)
     })
+}
+
+/// Fills `out` up to `count` lines of `{did, signedOp, keys}`, with one job (and one
+/// set of keys) per DID, so every grind key signs exactly one published op whatever
+/// the nonce mode. Each line is a single write, so an interrupted run loses at most
+/// the DID it was grinding.
+fn stock(rule: Rule, recovery: Option<&str>, count: usize, out: &Path, args: &GrindArgs) -> Result<()> {
+    use std::{collections::HashSet, io::Write};
+
+    rule.validate()?;
+    let mut seen = HashSet::new();
+    if out.exists() {
+        let text = std::fs::read_to_string(out).with_context(|| format!("reading {}", out.display()))?;
+        for (n, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+            let entry: Value = serde_json::from_str(line).with_context(|| format!("{}:{}: not JSON", out.display(), n + 1))?;
+            let did = entry["did"].as_str().with_context(|| format!("{}:{}: no did", out.display(), n + 1))?;
+            seen.insert(did.to_owned());
+        }
+    }
+    if seen.len() >= count {
+        eprintln!("{} already holds {} DIDs", out.display(), seen.len());
+        return Ok(());
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(out).with_context(|| format!("opening {}", out.display()))?;
+
+    let threads = args.threads.unwrap_or_else(logical_cpus);
+    let limits = || Limits { max_attempts: args.max_attempts, ..Default::default() };
+    // One line per DID replaces the periodic progress lines, which would drown it.
+    let every = Duration::MAX;
+    let gpu = if args.gpu.gpu { Some(gpu(&args.gpu)?) } else { None };
+    let start = Instant::now();
+    let have = seen.len();
+    let mut attempts = 0u64;
+
+    eprintln!("stock: {have} of {count} in {}, grinding {}", out.display(), count - have);
+    while seen.len() < count {
+        let init = init::init(&rule, recovery)?;
+        let grinder = Grinder::new(serde_json::from_value(init.job)?)?;
+        let outcome = match &gpu {
+            Some(gpu) => gpu.run(&grinder, limits(), every, |_, _| {}, |_| Ok(()))?,
+            None => grinder.run(threads, args.nonce, limits(), every, |_, _| {}, |_| Ok(()))?,
+        };
+        attempts += outcome.attempts;
+        let Some(hit) = outcome.hit else {
+            eprintln!("no match within --max-attempts");
+            std::process::exit(2)
+        };
+        // Two jobs landing on one DID would need a SHA-256 collision, but a repeat
+        // line would hand the same identity out twice, so it is checked anyway.
+        if !seen.insert(hit.did.clone()) {
+            continue;
+        }
+
+        let mut keys = init.keys;
+        keys.as_object_mut().expect("keys is an object").remove("note");
+        let line = serde_json::to_string(&json!({ "did": hit.did, "signedOp": hit.signed_op, "keys": keys }))?;
+        file.write_all(format!("{line}\n").as_bytes())?;
+        file.sync_data()?;
+
+        let done = (seen.len() - have) as f64;
+        let elapsed = start.elapsed().as_secs_f64();
+        let left = (count - seen.len()) as f64 * elapsed / done;
+        eprintln!("{}/{count} {}  {:.0}/s, ~{left:.0}s left", seen.len(), hit.did, attempts as f64 / elapsed);
+    }
+    eprintln!("stock: {} holds {count} DIDs", out.display());
+    Ok(())
 }
 
 fn progress(attempts: u64, elapsed: Duration) {
