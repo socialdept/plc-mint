@@ -8,6 +8,7 @@ Part of the [plc-mint docs](introduction.md#documentation). Every `plc-mint` sub
 plc-mint init --mode prefix --value mig --out DIR  # keys.json + job.json
 plc-mint grind --job job.json --nonce incremental  # stdout: the hit as JSON
 plc-mint mint --value mig --out DIR --gpu          # init + grind: keys.json, job.json, hit.json
+plc-mint stock --value mig --count 1000 --recovery did:key:… --out mig.jsonl  # many DIDs, one line each
 plc-mint bench --seconds 300 --threads 10          # sustained attempts/s, every nonce mode
 plc-mint profile                                   # ns per signature per nonce mode, and per hash check
 plc-mint verify signed-op.json                     # recompute DID + check signature
@@ -21,6 +22,7 @@ plc-mint gpu-selftest                              # GPU builds: every GPU signa
 | `init --mode --value --out DIR [--recovery did:key]` | Writes `DIR/keys.json` and `DIR/job.json` (mode 0600, never overwritten). `--mode` is `prefix` (default), `contains` or `suffix`. The value is lowercased and validated. |
 | `grind --job <file\|->` | Grind until the DID matches. `--threads N` (default: all logical CPUs), `--nonce MODE` (default `rfc6979`), `--gpu`, `--max-attempts N` gives up with exit code 2, `--save-alternatives DIR` saves alternatives (up to `--alternatives N` per position, default 10). Progress goes to stderr every `--report-every` seconds (default 5). |
 | `mint` | `init`, then `grind` on the new job. Writes `DIR/hit.json` and prints the DID, saving alternatives to `DIR/alternatives/` as they turn up. Takes the options of both. Refuses to start if `DIR/hit.json` already exists. |
+| `stock --mode --value --count N --out FILE [--recovery did:key]` | Runs `init` and `grind` once per DID until `FILE` holds `N` lines of `{did, signedOp, keys}`, where `keys` is the `keys.json` of that DID. Every DID gets its own grind and temp signing keys. A rerun counts the lines already there and tops the file up. The file is created with mode 0600. Takes the `grind` options, without alternatives. See [Stocking many DIDs](getting-started/minting.md#stocking-many-dids). |
 | `bench` | Grinds a never-matching job for `--seconds` (default 60) at every combination of `--nonce a,b` (default: all) and `--threads a,b` (such as `1,6,12`, default: all logical CPUs), one JSON line per run: `{nonce, threads, seconds, attempts, rate, ratePerThread}`. With `--gpu` it makes one GPU run instead: `{backend, batch, gpuThreads, seconds, attempts, rate}`. |
 | `profile` | Single-threaded ns per signature for each nonce mode, ns per hash check, and the resulting attempts/s per thread. `--chunks N` sets the batches of 256 signatures timed per mode (default 40). |
 | `verify <file\|->` | Takes a signed op, or `{did, operation}` as in a `plc.directory/:did/log/audit` entry. Prints the DID, the signing rotation key and, if given, whether it matches the expected DID. |
